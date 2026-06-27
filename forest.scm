@@ -1,6 +1,8 @@
 (require "helix/components.scm")
 (require "helix/misc.scm")
 (require "helix/editor.scm")
+(require "helix/static.scm")
+(require "helix/ext.scm")
 (require (prefix-in helix. "helix/commands.scm"))
 
 (define *forest-width* 32)
@@ -128,6 +130,14 @@
   (set! *forest-cursor* 0)
   (set! *forest-window-start* 0))
 
+;; refreshes the view after an eaction like deletion
+(define (forest-refresh-all!)
+  (define old *forest-cursor*)
+  (forest-build-tree!)
+  (forest-scan-files!)
+  (forest-refresh-search!)
+  (set! *forest-cursor* (min old (max 0 (- (forest-active-count) 1)))))
+
 (define (forest-toggle-dir! path)
   (set! *forest-directories*
         (hash-insert *forest-directories* path (not (hash-try-get *forest-directories* path))))
@@ -166,6 +176,165 @@
   (pop-last-component-by-name! "forest-fg")
   (pop-last-component-by-name! "forest-bg")
   (enqueue-thread-local-callback (lambda () (set-editor-clip-left! 0))))
+
+;; footer for rename
+(define *forest-input-prompt* "")
+(define *forest-input-buffer* "")
+(define *forest-input-callback* #f)
+
+(struct ForestInputState ())
+
+(define (forest-input-render state rect frame)
+  (define w (area-width rect))
+  (define y (- (area-height rect) 1))
+  (define text (string-append *forest-input-prompt* *forest-input-buffer*))
+  (define st (theme-scope-ref "ui.text"))
+  (frame-set-string! frame 0 y (make-string w #\space) st)
+  (frame-set-string! frame 0 y (forest-truncate text (- w 1)) st))
+
+(define (forest-input-cursor-fn state area)
+  (position (- (area-height area) 1)
+            (string-length (string-append *forest-input-prompt* *forest-input-buffer*))))
+
+(define (forest-input-handle-event state event)
+  (define ch (key-event-char event))
+  (cond
+    [(key-event-enter? event)
+     (define result *forest-input-buffer*)
+     (define cb *forest-input-callback*)
+     (set! *forest-input-callback* #f)
+     (when cb (enqueue-thread-local-callback (lambda () (cb result))))
+     event-result/close]
+    [(key-event-escape? event)
+     (set! *forest-input-callback* #f)
+     event-result/close]
+    [(key-event-backspace? event)
+     (define len (string-length *forest-input-buffer*))
+     (when (> len 0)
+       (set! *forest-input-buffer* (substring *forest-input-buffer* 0 (- len 1))))
+     event-result/consume]
+    [(char? ch)
+     (set! *forest-input-buffer* (string-append *forest-input-buffer* (string ch)))
+     event-result/consume]
+    [else event-result/consume]))
+
+(define (forest-show-input! prompt-text initial-value callback)
+  (set! *forest-input-prompt* prompt-text)
+  (set! *forest-input-buffer* initial-value)
+  (set! *forest-input-callback* callback)
+  (push-component!
+   (new-component! "forest-input"
+                   (ForestInputState)
+                   forest-input-render
+                   (hash "handle_event" forest-input-handle-event
+                         "cursor" forest-input-cursor-fn))))
+
+;; footer for confirmation
+(define *forest-confirm-prompt* "")
+(define *forest-confirm-callback* #f)
+
+(struct ForestConfirmState ())
+
+(define (forest-confirm-render state rect frame)
+  (define w (area-width rect))
+  (define y (- (area-height rect) 1))
+  (define st (theme-scope-ref "ui.text"))
+  (frame-set-string! frame 0 y (make-string w #\space) st)
+  (frame-set-string! frame 0 y (forest-truncate *forest-confirm-prompt* (- w 1)) st))
+
+(define (forest-confirm-handle-event state event)
+  (define ch (key-event-char event))
+  (define cb *forest-confirm-callback*)
+  (set! *forest-confirm-callback* #f)
+  (when cb (enqueue-thread-local-callback (lambda () (cb (and (char? ch) (equal? ch #\y))))))
+  event-result/close)
+
+(define (forest-show-confirm! prompt-text callback)
+  (set! *forest-confirm-prompt* prompt-text)
+  (set! *forest-confirm-callback* callback)
+  (push-component!
+   (new-component! "forest-confirm"
+                   (ForestConfirmState)
+                   forest-confirm-render
+                   (hash "handle_event" forest-confirm-handle-event))))
+
+;; shells out to mv mkdir since steel has no rename builtin
+(define (forest-run-mv! from-path to-path)
+  (let ([proc (~> (command "mv" (list from-path to-path))
+                  with-stdout-piped
+                  with-stderr-piped
+                  spawn-process)])
+    (if (Ok? proc)
+        (let ([stderr (read-port-to-string (child-stderr (Ok->value proc)))])
+          (when (not (string=? (trim stderr) ""))
+            (error (trim stderr))))
+        (error "mv: could not spawn process"))))
+
+(define (forest-run-mkdir-p! path)
+  (let ([proc (~> (command "mkdir" (list "-p" path))
+                  with-stdout-piped
+                  with-stderr-piped
+                  spawn-process)])
+    (if (Ok? proc)
+        (let ([stderr (read-port-to-string (child-stderr (Ok->value proc)))])
+          (when (not (string=? (trim stderr) ""))
+            (error (trim stderr))))
+        (error "mkdir: could not spawn process"))))
+
+(define (forest-prompt-create!)
+  (define entry (forest-current-entry))
+  (when entry
+    (define path (car entry))
+    (define base (if (is-dir? path)
+                      (string-append path (path-separator))
+                      (trim-end-matches path (file-name path))))
+    (enqueue-thread-local-callback
+     (lambda ()
+       (push-component!
+        (prompt (string-append "New (end with " (path-separator) " for dir): " base)
+                (lambda (name)
+                  (define full (string-append base name))
+                  (if (ends-with? name (path-separator))
+                      (forest-run-mkdir-p! full)
+                      (begin
+                        (helix.vsplit-new)
+                        (helix.open full)
+                        (helix.write full)
+                        (helix.quit)))
+                  (enqueue-thread-local-callback forest-refresh-all!))))))))
+
+(define (forest-prompt-rename!)
+  (define entry (forest-current-entry))
+  (when entry
+    (define path (car entry))
+    (define name (file-name path))
+    (define dir (trim-end-matches path (string-append (path-separator) name)))
+    (enqueue-thread-local-callback
+     (lambda ()
+       (forest-show-input!
+        "Rename: "
+        name
+        (lambda (new-name)
+          (when (and (not (equal? new-name "")) (not (equal? new-name name)))
+            (forest-run-mv! path (string-append dir (path-separator) new-name))
+            (enqueue-thread-local-callback forest-refresh-all!))))))))
+
+(define (forest-prompt-delete!)
+  (define entry (forest-current-entry))
+  (when entry
+    (define path (car entry))
+    (define name (file-name path))
+    (define kind (if (is-dir? path) "directory" "file"))
+    (enqueue-thread-local-callback
+     (lambda ()
+       (forest-show-confirm!
+        (string-append "Delete " kind " '" name "'? (y/N) ")
+        (lambda (confirmed?)
+          (when confirmed?
+            (if (is-dir? path)
+                (delete-directory! path) ; only works if empty
+                (delete-file! path))
+            (enqueue-thread-local-callback forest-refresh-all!))))))))
 
 (struct ForestBgState ())
 
@@ -255,6 +424,20 @@
     [(and (char? ch) (equal? ch #\q) (equal? (key-event-modifier event) key-modifier-ctrl))
      (forest-close!)
      event-result/close] ; pops fg; forest-close! already popped bg
+
+    ;; Ctrl+<letter> cuz plain letters need stay free for search
+    [(and (char? ch) (equal? ch #\n) (equal? (key-event-modifier event) key-modifier-ctrl))
+     (forest-prompt-create!)
+     event-result/consume]
+    [(and (char? ch) (equal? ch #\r) (equal? (key-event-modifier event) key-modifier-ctrl))
+     (forest-prompt-rename!)
+     event-result/consume]
+    [(and (char? ch) (equal? ch #\x) (equal? (key-event-modifier event) key-modifier-ctrl))
+     (forest-prompt-delete!)
+     event-result/consume]
+    [(and (char? ch) (equal? ch #\e) (equal? (key-event-modifier event) key-modifier-ctrl))
+     (forest-refresh-all!)
+     event-result/consume]
 
     [(key-event-backspace? event)
      (forest-backspace!)
