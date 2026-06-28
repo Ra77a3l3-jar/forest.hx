@@ -4,6 +4,13 @@
 (require "helix/static.scm")
 (require "helix/ext.scm")
 (require (prefix-in helix. "helix/commands.scm"))
+(require "notify/notify.scm")
+
+(define (forest-info msg)
+  (notify msg #:title "forest.hx"))
+
+(define (forest-error msg)
+  (notify msg #:severity 'error #:title "forest.hx"))
 
 (define *forest-width* 32)
 (define *forest-search-height* 3)
@@ -37,6 +44,14 @@
 
 (define (forest-repeat-str s n)
   (if (<= n 0) "" (string-append s (forest-repeat-str s (- n 1)))))
+
+;; strips the workspace prefix so prompts show a short path instead of the full one
+(define (forest-relpath path)
+  (define prefix (string-append (helix-find-workspace) (path-separator)))
+  (if (and (>= (string-length path) (string-length prefix))
+           (equal? (substring path 0 (string-length prefix)) prefix))
+      (substring path (string-length prefix) (string-length path))
+      path))
 
 (define (forest-searching?) (not (equal? *forest-query* "")))
 
@@ -177,86 +192,82 @@
   (pop-last-component-by-name! "forest-bg")
   (enqueue-thread-local-callback (lambda () (set-editor-clip-left! 0))))
 
-;; footer for rename
-(define *forest-input-prompt* "")
-(define *forest-input-buffer* "")
-(define *forest-input-callback* #f)
+(define *forest-modal-mode* 'input)
+(define *forest-modal-label* "")
+(define *forest-modal-buffer* "")
+(define *forest-modal-callback* #f)
 
-(struct ForestInputState ())
+(struct ForestModalState ())
 
-(define (forest-input-render state rect frame)
-  (define w (area-width rect))
-  (define y (- (area-height rect) 1))
-  (define text (string-append *forest-input-prompt* *forest-input-buffer*))
-  (define st (theme-scope-ref "ui.text"))
-  (frame-set-string! frame 0 y (make-string w #\space) st)
-  (frame-set-string! frame 0 y (forest-truncate text (- w 1)) st))
+(define (forest-modal-width rect)
+  (define content-len (+ (string-length *forest-modal-label*) (string-length *forest-modal-buffer*)))
+  (min (- (area-width rect) 4) (max 40 (+ content-len 4))))
 
-(define (forest-input-cursor-fn state area)
-  (position (- (area-height area) 1)
-            (string-length (string-append *forest-input-prompt* *forest-input-buffer*))))
+(define (forest-modal-origin rect)
+  (define w (forest-modal-width rect))
+  (define x (quotient (- (area-width rect) w) 2))
+  (define y (quotient (- (area-height rect) 3) 2))
+  (list x y w))
 
-(define (forest-input-handle-event state event)
+(define (forest-modal-render state rect frame)
+  (define origin (forest-modal-origin rect))
+  (define x (list-ref origin 0))
+  (define y (list-ref origin 1))
+  (define w (list-ref origin 2))
+  (define bg-style (theme-scope-ref "ui.background"))
+  (define text-style (theme-scope-ref "ui.text"))
+  (define modal-area (area x y w 3))
+  (buffer/clear-with frame modal-area bg-style)
+  (block/render frame modal-area (make-block bg-style bg-style "all" "rounded"))
+  (define text (string-append *forest-modal-label* *forest-modal-buffer*))
+  (frame-set-string! frame (+ x 1) (+ y 1) (forest-truncate text (- w 2)) text-style))
+
+(define (forest-modal-cursor-fn state rect)
+  (if (equal? *forest-modal-mode* 'confirm)
+      #f ; single keypress, no caret needed
+      (let* ([origin (forest-modal-origin rect)]
+             [x (list-ref origin 0)]
+             [y (list-ref origin 1)])
+        (position (+ y 1) (+ x 1 (string-length *forest-modal-label*) (string-length *forest-modal-buffer*))))))
+
+(define (forest-modal-handle-event state event)
   (define ch (key-event-char event))
   (cond
+    [(equal? *forest-modal-mode* 'confirm)
+     (define cb *forest-modal-callback*)
+     (set! *forest-modal-callback* #f)
+     (when cb (enqueue-thread-local-callback (lambda () (cb (and (char? ch) (equal? ch #\y))))))
+     event-result/close]
     [(key-event-enter? event)
-     (define result *forest-input-buffer*)
-     (define cb *forest-input-callback*)
-     (set! *forest-input-callback* #f)
+     (define result *forest-modal-buffer*)
+     (define cb *forest-modal-callback*)
+     (set! *forest-modal-callback* #f)
      (when cb (enqueue-thread-local-callback (lambda () (cb result))))
      event-result/close]
     [(key-event-escape? event)
-     (set! *forest-input-callback* #f)
+     (set! *forest-modal-callback* #f)
      event-result/close]
     [(key-event-backspace? event)
-     (define len (string-length *forest-input-buffer*))
+     (define len (string-length *forest-modal-buffer*))
      (when (> len 0)
-       (set! *forest-input-buffer* (substring *forest-input-buffer* 0 (- len 1))))
+       (set! *forest-modal-buffer* (substring *forest-modal-buffer* 0 (- len 1))))
      event-result/consume]
     [(char? ch)
-     (set! *forest-input-buffer* (string-append *forest-input-buffer* (string ch)))
+     (set! *forest-modal-buffer* (string-append *forest-modal-buffer* (string ch)))
      event-result/consume]
     [else event-result/consume]))
 
-(define (forest-show-input! prompt-text initial-value callback)
-  (set! *forest-input-prompt* prompt-text)
-  (set! *forest-input-buffer* initial-value)
-  (set! *forest-input-callback* callback)
+(define (forest-show-modal! mode label initial-value callback)
+  (set! *forest-modal-mode* mode)
+  (set! *forest-modal-label* label)
+  (set! *forest-modal-buffer* initial-value)
+  (set! *forest-modal-callback* callback)
   (push-component!
-   (new-component! "forest-input"
-                   (ForestInputState)
-                   forest-input-render
-                   (hash "handle_event" forest-input-handle-event
-                         "cursor" forest-input-cursor-fn))))
-
-;; footer for confirmation
-(define *forest-confirm-prompt* "")
-(define *forest-confirm-callback* #f)
-
-(struct ForestConfirmState ())
-
-(define (forest-confirm-render state rect frame)
-  (define w (area-width rect))
-  (define y (- (area-height rect) 1))
-  (define st (theme-scope-ref "ui.text"))
-  (frame-set-string! frame 0 y (make-string w #\space) st)
-  (frame-set-string! frame 0 y (forest-truncate *forest-confirm-prompt* (- w 1)) st))
-
-(define (forest-confirm-handle-event state event)
-  (define ch (key-event-char event))
-  (define cb *forest-confirm-callback*)
-  (set! *forest-confirm-callback* #f)
-  (when cb (enqueue-thread-local-callback (lambda () (cb (and (char? ch) (equal? ch #\y))))))
-  event-result/close)
-
-(define (forest-show-confirm! prompt-text callback)
-  (set! *forest-confirm-prompt* prompt-text)
-  (set! *forest-confirm-callback* callback)
-  (push-component!
-   (new-component! "forest-confirm"
-                   (ForestConfirmState)
-                   forest-confirm-render
-                   (hash "handle_event" forest-confirm-handle-event))))
+   (new-component! "forest-modal"
+                   (ForestModalState)
+                   forest-modal-render
+                   (hash "handle_event" forest-modal-handle-event
+                         "cursor" forest-modal-cursor-fn))))
 
 ;; shells out to mv mkdir since steel has no rename builtin
 (define (forest-run-mv! from-path to-path)
@@ -290,18 +301,24 @@
                       (trim-end-matches path (file-name path))))
     (enqueue-thread-local-callback
      (lambda ()
-       (push-component!
-        (prompt (string-append "New (end with " (path-separator) " for dir): " base)
-                (lambda (name)
-                  (define full (string-append base name))
-                  (if (ends-with? name (path-separator))
-                      (forest-run-mkdir-p! full)
-                      (begin
-                        (helix.vsplit-new)
-                        (helix.open full)
-                        (helix.write full)
-                        (helix.quit)))
-                  (enqueue-thread-local-callback forest-refresh-all!))))))))
+       (forest-show-modal!
+        'input
+        (string-append "New (end with " (path-separator) " for dir): ")
+        (forest-relpath base)
+        (lambda (name)
+          (define full (string-append (helix-find-workspace) (path-separator) name))
+          (with-handler
+            (lambda (err) (forest-error (string-append "create failed: " (error-object-message err))))
+            (begin
+              (if (ends-with? name (path-separator))
+                  (forest-run-mkdir-p! full)
+                  (begin
+                    (helix.vsplit-new)
+                    (helix.open full)
+                    (helix.write full)
+                    (helix.quit)))
+              (forest-info (string-append "created " name))))
+          (enqueue-thread-local-callback forest-refresh-all!)))))))
 
 (define (forest-prompt-rename!)
   (define entry (forest-current-entry))
@@ -311,12 +328,17 @@
     (define dir (trim-end-matches path (string-append (path-separator) name)))
     (enqueue-thread-local-callback
      (lambda ()
-       (forest-show-input!
+       (forest-show-modal!
+        'input
         "Rename: "
         name
         (lambda (new-name)
           (when (and (not (equal? new-name "")) (not (equal? new-name name)))
-            (forest-run-mv! path (string-append dir (path-separator) new-name))
+            (with-handler
+              (lambda (err) (forest-error (string-append "rename failed: " (error-object-message err))))
+              (begin
+                (forest-run-mv! path (string-append dir (path-separator) new-name))
+                (forest-info (string-append "renamed " name " -> " new-name))))
             (enqueue-thread-local-callback forest-refresh-all!))))))))
 
 (define (forest-prompt-delete!)
@@ -327,13 +349,19 @@
     (define kind (if (is-dir? path) "directory" "file"))
     (enqueue-thread-local-callback
      (lambda ()
-       (forest-show-confirm!
+       (forest-show-modal!
+        'confirm
         (string-append "Delete " kind " '" name "'? (y/N) ")
+        ""
         (lambda (confirmed?)
           (when confirmed?
-            (if (is-dir? path)
-                (delete-directory! path) ; only works if empty
-                (delete-file! path))
+            (with-handler
+              (lambda (err) (forest-error (string-append "delete failed: " (error-object-message err))))
+              (begin
+                (if (is-dir? path)
+                    (delete-directory! path) ; only works if empty
+                    (delete-file! path))
+                (forest-info (string-append "deleted " name))))
             (enqueue-thread-local-callback forest-refresh-all!))))))))
 
 (struct ForestBgState ())
