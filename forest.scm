@@ -12,8 +12,11 @@
 (define (forest-error msg)
   (notify msg #:severity 'error #:title "forest.hx"))
 
-(define *forest-width* 32)
+(define *forest-width* 32) ;
+(define *forest-min-width* 16)
+(define *forest-max-width* 60)
 (define *forest-search-height* 3)
+(define *forest-side* 'left) ; left or right set with forest-configure!
 
 (define *forest-ignore-set*
   (hashset ".git" "target" ".direnv" "node_modules" "__pycache__" ".hg"))
@@ -30,6 +33,12 @@
 (define *forest-search-results* '())
 
 (provide forest-open)
+(provide forest-configure!)
+
+;;@doc
+;; Set whic side the file tree renders on
+(define (forest-configure! side)
+  (set! *forest-side* side))
 
 (define (forest-take lst n)
   (if (or (null? lst) (<= n 0)) '() (cons (car lst) (forest-take (cdr lst) (- n 1)))))
@@ -82,6 +91,46 @@
                     (forest-sort-entries (read-dir path)))))))
   (walk (helix-find-workspace) 0)
   (set! *forest-tree* (reverse result)))
+
+(define (forest-parent-path path)
+  (trim-end-matches path (string-append (path-separator) (file-name path))))
+
+(define (forest-half-floor n)
+  (let loop ([n n] [h 0])
+    (if (< n 2) h (loop (- n 2) (+ h 1)))))
+
+;; marks every old dir between the workspace root and path as open
+(define (forest-open-ancestors-for-file! path)
+  (define ws (helix-find-workspace))
+  (define ws-prefix (string-append ws (path-separator)))
+  (when (and (string? path)
+             (>= (string-length path) (string-length ws-prefix))
+             (equal? (substring path 0 (string-length ws-prefix)) ws-prefix))
+    (define (open-up! p)
+      (define parent (forest-parent-path p))
+      (set! *forest-directories* (hash-insert *forest-directories* parent #f))
+      (unless (equal? parent ws)
+        (open-up! parent)))
+    (open-up! path)))
+
+;; moves the cursor to the file path
+(define (forest-seek-file! path)
+  (when (string? path)
+    (define idx
+      (let loop ([items *forest-tree*] [i 0])
+        (cond [(null? items) #f]
+              [(equal? (car (car items)) path) i]
+              [else (loop (cdr items) (+ i 1))])))
+    (when idx
+      (set! *forest-cursor* idx)
+      (set! *forest-window-start*
+            (max 0 (- idx (forest-half-floor *forest-visible-height*)))))))
+
+(define (forest-reveal-current-file!)
+  (define path (editor-document->path (editor->doc-id (editor-focus))))
+  (forest-open-ancestors-for-file! path)
+  (forest-build-tree!)
+  (forest-seek-file! path))
 
 ;; flat recursive file list for search
 ;; researches files independent of the fold state
@@ -190,7 +239,19 @@
   (set! *forest-focused* #f)
   (pop-last-component-by-name! "forest-fg")
   (pop-last-component-by-name! "forest-bg")
-  (enqueue-thread-local-callback (lambda () (set-editor-clip-left! 0))))
+  (enqueue-thread-local-callback
+   (lambda ()
+     (if (equal? *forest-side* 'right)
+         (set-editor-clip-right! 0)
+         (set-editor-clip-left! 0)))))
+
+(define (forest-wider!)
+  (set! *forest-width* (min *forest-max-width* (+ *forest-width* 2)))
+  (helix.redraw '()))
+
+(define (forest-narrower!)
+  (set! *forest-width* (max *forest-min-width* (- *forest-width* 2)))
+  (helix.redraw '()))
 
 (define *forest-modal-mode* 'input)
 (define *forest-modal-label* "")
@@ -366,11 +427,18 @@
 
 (struct ForestBgState ())
 
+;; panel's left edge is 0 when left else put against the right edge
+(define (forest-panel-x0 rect w)
+  (if (equal? *forest-side* 'right) (- (area-width rect) w) 0))
+
 (define (forest-render-bg state rect frame)
   (define w (min *forest-width* (area-width rect)))
   (define h (area-height rect))
+  (define x0 (forest-panel-x0 rect w))
   (set! *forest-visible-height* (max 1 (- h *forest-search-height*)))
-  (set-editor-clip-left! w)
+  (if (equal? *forest-side* 'right)
+      (set-editor-clip-right! w)
+      (set-editor-clip-left! w))
 
   ;; theme components
   (define bg-style (theme-scope-ref "ui.background"))
@@ -380,19 +448,19 @@
   (define dim-style (style-with-dim (theme-scope-ref "ui.text")))
 
   ;; no border for cleaner look
-  (define panel-area (area 0 0 w h))
+  (define panel-area (area x0 0 w h))
   (buffer/clear-with frame panel-area bg-style)
 
-  (define search-area (area 0 0 w *forest-search-height*))
+  (define search-area (area x0 0 w *forest-search-height*))
   (block/render frame search-area (make-block bg-style bg-style "all" "rounded"))
-  (frame-set-string! frame 1 1 (forest-truncate *forest-query* (- w 2)) text-style)
+  (frame-set-string! frame (+ x0 1) 1 (forest-truncate *forest-query* (- w 2)) text-style)
 
   (define list-y0 *forest-search-height*)
   (define max-text-w (- w 1))
 
   (if (forest-searching?)
       (if (null? *forest-search-results*)
-          (frame-set-string! frame 1 list-y0 "(no matches)" dim-style)
+          (frame-set-string! frame (+ x0 1) list-y0 "(no matches)" dim-style)
           (let ([visible (forest-take (forest-drop *forest-search-results* *forest-window-start*)
                                        *forest-visible-height*)])
             (let loop ([items visible] [row 0])
@@ -402,8 +470,8 @@
                 (define y (+ list-y0 row))
                 (define hl? (= abs-idx *forest-cursor*))
                 (when hl?
-                  (frame-set-string! frame 0 y (make-string w #\space) hl-style))
-                (frame-set-string! frame 0 y text (if hl? hl-style text-style))
+                  (frame-set-string! frame x0 y (make-string w #\space) hl-style))
+                (frame-set-string! frame x0 y text (if hl? hl-style text-style))
                 (loop (cdr items) (+ row 1))))))
       (let ([visible (forest-take (forest-drop *forest-tree* *forest-window-start*)
                                    *forest-visible-height*)])
@@ -416,8 +484,8 @@
             (define y (+ list-y0 row))
             (define hl? (= abs-idx *forest-cursor*))
             (when hl?
-              (frame-set-string! frame 0 y (make-string w #\space) hl-style))
-            (frame-set-string! frame 0 y text
+              (frame-set-string! frame x0 y (make-string w #\space) hl-style))
+            (frame-set-string! frame x0 y text
                                (cond [hl? hl-style]
                                      [(is-dir? path) dir-style]
                                      [else text-style]))
@@ -432,7 +500,9 @@
 (define (forest-render-fg state rect frame) void) ; bg handles all drawing
 
 (define (forest-cursor-fn-fg state area)
-  (position 1 (+ 1 (string-length *forest-query*))))
+  (define w (min *forest-width* (area-width area)))
+  (define x0 (forest-panel-x0 area w))
+  (position 1 (+ x0 1 (string-length *forest-query*))))
 
 (define (forest-handle-event-fg state event)
   (define ch (key-event-char event))
@@ -465,6 +535,14 @@
      event-result/consume]
     [(and (char? ch) (equal? ch #\e) (equal? (key-event-modifier event) key-modifier-ctrl))
      (forest-refresh-all!)
+     event-result/consume]
+
+    ;; Alt key for changing size since ctrl is used for font resizing
+    [(and (char? ch) (or (equal? ch #\+) (equal? ch #\=)) (equal? (key-event-modifier event) key-modifier-alt))
+     (forest-wider!)
+     event-result/consume]
+    [(and (char? ch) (equal? ch #\-) (equal? (key-event-modifier event) key-modifier-alt))
+     (forest-narrower!)
      event-result/consume]
 
     [(key-event-backspace? event)
@@ -501,7 +579,7 @@
      (set! *forest-window-start* 0)
      (set! *forest-query* "")
      (set! *forest-search-results* '())
-     (forest-build-tree!)
+     (forest-reveal-current-file!)
      (forest-scan-files!)
      (push-component! (forest-make-bg-component))
      (push-component! (forest-make-fg-component))]
@@ -511,4 +589,5 @@
 
     [else
      (set! *forest-focused* #t)
+     (forest-reveal-current-file!)
      (push-component! (forest-make-fg-component))]))
