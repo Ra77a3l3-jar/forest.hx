@@ -2,6 +2,8 @@
 
 forest.hx is a file tree explorer for [Helix](https://github.com/helix-editor/helix/), built as a persistent sidebar panel with an integrated fuzzy search bar.
 
+![forest.hx preview](.github/assets/preview.gif)
+
 ---
 
 ## Installation
