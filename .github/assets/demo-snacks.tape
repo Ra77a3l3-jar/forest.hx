@@ -1,5 +1,5 @@
-# VHS tape for forest.hx — https://github.com/charmbracelet/vhs
-# Run with: vhs demo.tape
+# VHS tape for forest.hx (snacks style) — https://github.com/charmbracelet/vhs
+# Run with: vhs demo-snacks.tape
 #
 # Uses ~/Dev/ziglings as the sandbox project: it's a git repo, so any mistake
 # is trivially reversible, and the script deletes its own test file at the
