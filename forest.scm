@@ -32,6 +32,7 @@
 (define *forest-query* "")
 (define *forest-all-files* '())
 (define *forest-search-results* '())
+(define *forest-typing?* #f)
 
 (provide forest-open)
 (provide forest-configure!)
@@ -191,6 +192,20 @@
   (define len (string-length *forest-query*))
   (when (> len 0)
     (set! *forest-query* (substring *forest-query* 0 (- len 1))))
+  (forest-refresh-search!)
+  (set! *forest-cursor* 0)
+  (set! *forest-window-start* 0))
+
+;; / starts a new query  and letters stay free for single-key commands
+(define (forest-enter-search!)
+  (set! *forest-typing?* #t)
+  (set! *forest-query* "")
+  (forest-refresh-search!)
+  (set! *forest-cursor* 0)
+  (set! *forest-window-start* 0))
+
+(define (forest-clear-search!)
+  (set! *forest-query* "")
   (forest-refresh-search!)
   (set! *forest-cursor* 0)
   (set! *forest-window-start* 0))
@@ -517,12 +532,34 @@
 
 (define (forest-render-fg state rect frame) void) ; bg handles all drawing
 
+;; cursor only needs to appear while actively typing a search query
 (define (forest-cursor-fn-fg state area)
-  (define w (min *forest-width* (area-width area)))
-  (define x0 (forest-panel-x0 area w))
-  (position 1 (+ x0 1 (string-length *forest-query*))))
+  (if *forest-typing?*
+      (let* ([w (min *forest-width* (area-width area))]
+             [x0 (forest-panel-x0 area w)])
+        (position 1 (+ x0 1 (string-length *forest-query*))))
+      #f))
 
-(define (forest-handle-event-fg state event)
+(define (forest-handle-event-typing state event)
+  (define ch (key-event-char event))
+  (cond
+    [(key-event-enter? event)
+     (set! *forest-typing?* #f)
+     (forest-activate!)]
+    [(key-event-escape? event)
+     ;; leaves the filtered results in place
+     ;; stops updating the query
+     (set! *forest-typing?* #f)
+     event-result/consume]
+    [(key-event-backspace? event)
+     (forest-backspace!)
+     event-result/consume]
+    [(char? ch)
+     (forest-type! ch)
+     event-result/consume]
+    [else event-result/consume]))
+
+(define (forest-handle-event-command state event)
   (define ch (key-event-char event))
   (cond
     [(key-event-down? event) (forest-cursor-down!) event-result/consume]
@@ -537,41 +574,35 @@
      (forest-switch-to-editor!)
      event-result/close] ; pops fg only; bg stays visible
 
-    [(and (char? ch) (equal? ch #\q) (equal? (key-event-modifier event) key-modifier-ctrl))
-     (forest-close!)
-     event-result/close] ; pops fg; forest-close! already popped bg
-
-    ;; Ctrl+<letter> cuz plain letters need stay free for search
-    [(and (char? ch) (equal? ch #\n) (equal? (key-event-modifier event) key-modifier-ctrl))
-     (forest-prompt-create!)
-     event-result/consume]
-    [(and (char? ch) (equal? ch #\r) (equal? (key-event-modifier event) key-modifier-ctrl))
-     (forest-prompt-rename!)
-     event-result/consume]
-    [(and (char? ch) (equal? ch #\x) (equal? (key-event-modifier event) key-modifier-ctrl))
-     (forest-prompt-delete!)
-     event-result/consume]
-    [(and (char? ch) (equal? ch #\e) (equal? (key-event-modifier event) key-modifier-ctrl))
-     (forest-refresh-all!)
-     event-result/consume]
-
-    ;; Alt key for changing size since ctrl is used for font resizing
-    [(and (char? ch) (or (equal? ch #\+) (equal? ch #\=)) (equal? (key-event-modifier event) key-modifier-alt))
-     (forest-wider!)
-     event-result/consume]
-    [(and (char? ch) (equal? ch #\-) (equal? (key-event-modifier event) key-modifier-alt))
-     (forest-narrower!)
+    [(and (char? ch) (equal? ch #\/))
+     (forest-enter-search!)
      event-result/consume]
 
     [(key-event-backspace? event)
-     (forest-backspace!)
+     (forest-clear-search!)
      event-result/consume]
 
-    [(char? ch)
-     (forest-type! ch)
-     event-result/consume]
+    [(and (char? ch) (equal? ch #\j)) (forest-cursor-down!) event-result/consume]
+    [(and (char? ch) (equal? ch #\k)) (forest-cursor-up!) event-result/consume]
+
+    [(and (char? ch) (equal? ch #\q))
+     (forest-close!)
+     event-result/close] ; pops fg; forest-close! already popped bg
+
+    [(and (char? ch) (equal? ch #\n)) (forest-prompt-create!) event-result/consume]
+    [(and (char? ch) (equal? ch #\r)) (forest-prompt-rename!) event-result/consume]
+    [(and (char? ch) (equal? ch #\d)) (forest-prompt-delete!) event-result/consume]
+    [(and (char? ch) (equal? ch #\R)) (forest-refresh-all!) event-result/consume]
+
+    [(and (char? ch) (or (equal? ch #\+) (equal? ch #\=))) (forest-wider!) event-result/consume]
+    [(and (char? ch) (equal? ch #\-)) (forest-narrower!) event-result/consume]
 
     [else event-result/consume])) ; block unknown keys from editor while focused
+
+(define (forest-handle-event-fg state event)
+  (if *forest-typing?*
+      (forest-handle-event-typing state event)
+      (forest-handle-event-command state event)))
 
 (define (forest-make-bg-component)
   (new-component! "forest-bg"
@@ -597,6 +628,7 @@
      (set! *forest-window-start* 0)
      (set! *forest-query* "")
      (set! *forest-search-results* '())
+     (set! *forest-typing?* #f)
      (forest-reveal-current-file!)
      (forest-scan-files!)
      (push-component! (forest-make-bg-component))

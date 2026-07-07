@@ -39,20 +39,20 @@ Bind `:forest-open` to a key, e.g. in `init.scm`:
 
 | Key | Action |
 |-----|--------|
-| `↑` / `↓` | Navigate |
+| `↑` / `↓` / `j` / `k` | Navigate |
 | `Enter` | Open the selected file, or toggle the selected directory |
 | `Tab` | Toggle the selected directory (outside search) |
+| `/` | Start typing a fuzzy search query |
+| `n` | Create a file or directory (end name with `/` for a directory) |
+| `r` | Rename the selected entry |
+| `d` | Delete the selected entry |
+| `R` | Refresh the tree |
+| `+` / `-` | Widen / narrow the panel |
 | `Esc` | Switch focus to the editor, panel stays open |
-| `Ctrl+q` | Close the panel |
-| `Ctrl+n` | Create a file or directory (end name with `/` for a directory) |
-| `Ctrl+r` | Rename the selected entry |
-| `Ctrl+x` | Delete the selected entry |
-| `Ctrl+e` | Refresh the tree |
-| `Alt+` / `Alt-` | Widen / narrow the panel |
+| `q` | Close the panel |
 
 Opening or refocusing the tree reveals and centers whatever file is currently open in the editor.
 
 ## Notes
 
-- Since every plain character types into the search bar, there are no single-letter shortcuts. Every action besides navigation uses `Ctrl`, and those bindings are fixed rather than configurable from `init.scm`.
 - Requires [notify.hx](https://github.com/chuwy/notify.hx) (pulled in automatically as a dependency) for create/rename/delete notifications.
