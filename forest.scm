@@ -277,6 +277,7 @@
   (set! *forest-width* (max *forest-min-width* (- *forest-width* 2)))
   (helix.redraw '()))
 
+(define *forest-modal-open?* #f)
 (define *forest-modal-mode* 'input)
 (define *forest-modal-label* "")
 (define *forest-modal-buffer* "")
@@ -321,16 +322,19 @@
     [(equal? *forest-modal-mode* 'confirm)
      (define cb *forest-modal-callback*)
      (set! *forest-modal-callback* #f)
+     (set! *forest-modal-open?* #f)
      (when cb (enqueue-thread-local-callback (lambda () (cb (and (char? ch) (equal? ch #\y))))))
      event-result/close]
     [(key-event-enter? event)
      (define result *forest-modal-buffer*)
      (define cb *forest-modal-callback*)
      (set! *forest-modal-callback* #f)
+     (set! *forest-modal-open?* #f)
      (when cb (enqueue-thread-local-callback (lambda () (cb result))))
      event-result/close]
     [(key-event-escape? event)
      (set! *forest-modal-callback* #f)
+     (set! *forest-modal-open?* #f)
      event-result/close]
     [(key-event-backspace? event)
      (define len (string-length *forest-modal-buffer*))
@@ -343,6 +347,7 @@
     [else event-result/consume]))
 
 (define (forest-show-modal! mode label initial-value callback)
+  (set! *forest-modal-open?* #t)
   (set! *forest-modal-mode* mode)
   (set! *forest-modal-label* label)
   (set! *forest-modal-buffer* initial-value)
@@ -608,9 +613,10 @@
     [else event-result/consume])) ; block unknown keys from editor while focused
 
 (define (forest-handle-event-fg state event)
-  (if *forest-typing?*
-      (forest-handle-event-typing state event)
-      (forest-handle-event-command state event)))
+  (cond
+    [*forest-modal-open?* event-result/ignore]
+    [*forest-typing?* (forest-handle-event-typing state event)]
+    [else (forest-handle-event-command state event)]))
 
 (define (forest-make-bg-component)
   (new-component! "forest-bg"
@@ -713,6 +719,16 @@
   (when (> (length *forest-mini-stack*) 1)
     (set! *forest-mini-stack* (forest-mini-drop-last *forest-mini-stack*))))
 
+;; rebuilds the active column in place after a create/rename/delete
+;; keeping the cursor in bounds
+(define (forest-mini-refresh-active!)
+  (define col (forest-mini-active-column))
+  (define new-entries (forest-mini-list-dir (ForestMiniColumn-path col)))
+  (define new-cursor (max 0 (min (forest-mini-cursor col) (- (length new-entries) 1))))
+  (set! *forest-mini-stack*
+        (append (forest-mini-drop-last *forest-mini-stack*)
+                (list (ForestMiniColumn (ForestMiniColumn-path col) new-entries (box new-cursor))))))
+
 (define (forest-mini-index-of lst target)
   (let loop ([l lst] [i 0])
     (cond
@@ -748,6 +764,19 @@
   (if (string? path)
       (forest-mini-build-stack-for root path)
       (list (ForestMiniColumn root (forest-mini-list-dir root) (box 0)))))
+
+;; flat recursive file list for search, independent of the cascaded columns
+(define (forest-mini-scan-files root)
+  (define prefix (string-append root (path-separator)))
+  (define acc '())
+  (define (walk dir)
+    (for-each
+     (lambda (p)
+       (unless (hashset-contains? *forest-ignore-set* (file-name p))
+         (if (is-dir? p) (walk p) (set! acc (cons p acc)))))
+     (with-handler (lambda (_) '()) (read-dir dir))))
+  (walk root)
+  (sort (map (lambda (p) (substring p (string-length prefix) (string-length p))) acc) string<?))
 
 ;; panels grow and shrink with their own content with safe bound clamping
 (define (forest-mini-longest-name entries)
@@ -797,6 +826,91 @@
     [(is-dir? (car entry)) (list 'dir (forest-mini-list-dir (car entry)))]
     [(is-file? (car entry)) (list 'file (forest-mini-preview-lines (car entry) *forest-mini-preview-max-lines*))]
     [else (list 'empty #f)]))
+
+(define (forest-mini-prompt-create!)
+  (define col (forest-mini-active-column))
+  (define base (string-append (ForestMiniColumn-path col) (path-separator)))
+  (enqueue-thread-local-callback
+   (lambda ()
+     (forest-show-modal!
+      'input
+      (string-append "New (end with " (path-separator) " for dir): ")
+      (forest-relpath base)
+      (lambda (name)
+        (define full (string-append (helix-find-workspace) (path-separator) name))
+        (with-handler
+          (lambda (err) (forest-error (string-append "create failed: " (error-object-message err))))
+          (begin
+            (if (ends-with? name (path-separator))
+                (forest-run-mkdir-p! full)
+                (begin
+                  (helix.vsplit-new)
+                  (helix.open full)
+                  (helix.write full)
+                  (helix.quit)))
+            (forest-info (string-append "created " name))))
+        (enqueue-thread-local-callback forest-mini-refresh-active!))))))
+
+(define (forest-mini-prompt-rename!)
+  (define entry (forest-mini-current-entry))
+  (when entry
+    (define path (car entry))
+    (define name (file-name path))
+    (define dir (trim-end-matches path (string-append (path-separator) name)))
+    (enqueue-thread-local-callback
+     (lambda ()
+       (forest-show-modal!
+        'input
+        "Rename: "
+        name
+        (lambda (new-name)
+          (when (and (not (equal? new-name "")) (not (equal? new-name name)))
+            (with-handler
+              (lambda (err) (forest-error (string-append "rename failed: " (error-object-message err))))
+              (begin
+                (forest-run-mv! path (string-append dir (path-separator) new-name))
+                (forest-info (string-append "renamed " name " -> " new-name))))
+            (enqueue-thread-local-callback forest-mini-refresh-active!))))))))
+
+(define (forest-mini-prompt-delete!)
+  (define entry (forest-mini-current-entry))
+  (when entry
+    (define path (car entry))
+    (define name (file-name path))
+    (define kind (if (is-dir? path) "directory" "file"))
+    (enqueue-thread-local-callback
+     (lambda ()
+       (forest-show-modal!
+        'confirm
+        (string-append "Delete " kind " '" name "'? (y/N) ")
+        ""
+        (lambda (confirmed?)
+          (when confirmed?
+            (with-handler
+              (lambda (err) (forest-error (string-append "delete failed: " (error-object-message err))))
+              (begin
+                (if (is-dir? path)
+                    (delete-directory! path) ; only works if empty
+                    (delete-file! path))
+                (forest-info (string-append "deleted " name))))
+            (enqueue-thread-local-callback forest-mini-refresh-active!))))))))
+
+;; searches the whole workspace and re-cascades the stack to the match
+(define (forest-mini-prompt-search!)
+  (define root (helix-find-workspace))
+  (enqueue-thread-local-callback
+   (lambda ()
+     (forest-show-modal!
+      'input
+      "Search: "
+      ""
+      (lambda (query)
+        (unless (equal? query "")
+          (define matches (fuzzy-match query (forest-mini-scan-files root)))
+          (if (null? matches)
+              (forest-error (string-append "no matches for '" query "'"))
+              (set! *forest-mini-stack*
+                    (forest-mini-build-stack-for root (string-append root (path-separator) (car matches)))))))))))
 
 (struct ForestMiniState ())
 
@@ -922,6 +1036,8 @@
 (define (forest-mini-handle-event state event)
   (define ch (key-event-char event))
   (cond
+    ;; do not register keys when doing new/rename
+    [*forest-modal-open?* event-result/ignore]
     [(key-event-down? event) (forest-mini-move! 1) event-result/consume]
     [(key-event-up? event) (forest-mini-move! -1) event-result/consume]
     [(and (char? ch) (equal? ch #\j)) (forest-mini-move! 1) event-result/consume]
@@ -936,6 +1052,12 @@
     [(or (key-event-escape? event) (and (char? ch) (equal? ch #\q)))
      (forest-mini-close!)
      event-result/close]
+
+    [(and (char? ch) (equal? ch #\n)) (forest-mini-prompt-create!) event-result/consume]
+    [(and (char? ch) (equal? ch #\r)) (forest-mini-prompt-rename!) event-result/consume]
+    [(and (char? ch) (equal? ch #\d)) (forest-mini-prompt-delete!) event-result/consume]
+    [(and (char? ch) (equal? ch #\R)) (forest-mini-refresh-active!) event-result/consume]
+    [(and (char? ch) (equal? ch #\/)) (forest-mini-prompt-search!) event-result/consume]
 
     [(and (char? ch) (or (equal? ch #\+) (equal? ch #\=))) (forest-mini-wider!) event-result/consume]
     [(and (char? ch) (equal? ch #\-)) (forest-mini-narrower!) event-result/consume]
