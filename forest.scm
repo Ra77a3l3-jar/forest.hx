@@ -22,6 +22,47 @@
 (define *forest-ignore-set*
   (hashset ".git" "target" ".direnv" "node_modules" "__pycache__" ".hg"))
 
+;; dotfiles and git-ignored entries are hidden by default
+(define *forest-show-hidden* #f)
+(define *forest-show-git-ignored* #f)
+(define *forest-git-ignored-set* (hashset))
+
+(define (forest-dotfile? name)
+  (and (> (string-length name) 0) (char=? (string-ref name 0) #\.)))
+
+(define (forest-git-repo? dir)
+  (let ([proc (~> (command "git" (list "-C" dir "rev-parse" "--is-inside-work-tree"))
+                  with-stdout-piped
+                  with-stderr-piped
+                  spawn-process)])
+    (and (Ok? proc)
+         (string=? (trim (read-port-to-string (child-stdout (Ok->value proc)))) "true"))))
+
+;; recomputes the set of workspace-relative paths git considers ignored
+(define (forest-scan-git-ignored! root)
+  (set! *forest-git-ignored-set*
+        (with-handler
+          (lambda (_) (hashset))
+          (if (not (forest-git-repo? root))
+              (hashset)
+              (let ([proc (~> (command "git" (list "-C" root "status" "--porcelain" "--ignored=matching"))
+                              with-stdout-piped
+                              with-stderr-piped
+                              spawn-process)])
+                (if (Ok? proc)
+                    (let* ([output (read-port-to-string (child-stdout (Ok->value proc)))]
+                           [lines (filter (lambda (l) (> (string-length l) 0)) (split-many output "\n"))])
+                      (apply hashset
+                             (filter (lambda (x) x)
+                                     (map (lambda (line)
+                                            (and (>= (string-length line) 3)
+                                                 (string=? (substring line 0 2) "!!")
+                                                 (trim-end-matches
+                                                  (trim (substring line 3 (string-length line)))
+                                                  (path-separator))))
+                                          lines))))
+                    (hashset)))))))
+
 (define *forest-active* #f)
 (define *forest-focused* #f)
 (define *forest-tree* '())
@@ -72,6 +113,9 @@
       (substring path (string-length prefix) (string-length path))
       path))
 
+(define (forest-git-ignored? path)
+  (hashset-contains? *forest-git-ignored-set* (forest-relpath path)))
+
 (define (forest-searching?) (not (equal? *forest-query* "")))
 
 ;; dirs before files, alphabetic oder
@@ -89,7 +133,9 @@
   (define result '())
   (define (walk path depth)
     (define name (file-name path))
-    (unless (hashset-contains? *forest-ignore-set* name)
+    (unless (or (hashset-contains? *forest-ignore-set* name)
+                (and (not *forest-show-hidden*) (forest-dotfile? name))
+                (and (not *forest-show-git-ignored*) (forest-git-ignored? path)))
       (define indent (forest-repeat-str "  " depth))
       (define marker (if (is-dir? path) (forest-dir-marker path) "  "))
       (set! result (cons (list path indent marker name) result))
@@ -225,6 +271,24 @@
   (forest-scan-files!)
   (forest-refresh-search!)
   (set! *forest-cursor* (min old (max 0 (- (forest-active-count) 1)))))
+
+(define *forest-refresh-mini-fn* #f)
+
+;; refreshes whichever style is active immediatelly
+(define (forest-refresh-current-style!)
+  (if (and (equal? *forest-style* 'mini) *forest-refresh-mini-fn*)
+      (*forest-refresh-mini-fn*)
+      (forest-refresh-all!)))
+
+(define (forest-toggle-hidden!)
+  (set! *forest-show-hidden* (not *forest-show-hidden*))
+  (forest-info (if *forest-show-hidden* "forest: showing dotfiles" "forest: hiding dotfiles"))
+  (forest-refresh-current-style!))
+
+(define (forest-toggle-git-ignored!)
+  (set! *forest-show-git-ignored* (not *forest-show-git-ignored*))
+  (forest-info (if *forest-show-git-ignored* "forest: showing git-ignored" "forest: hiding git-ignored"))
+  (forest-refresh-current-style!))
 
 (define (forest-toggle-dir! path)
   (set! *forest-directories*
@@ -607,6 +671,9 @@
     [(and (char? ch) (equal? ch #\d)) (forest-prompt-delete!) event-result/consume]
     [(and (char? ch) (equal? ch #\R)) (forest-refresh-all!) event-result/consume]
 
+    [(and (char? ch) (equal? ch #\g)) (forest-toggle-hidden!) event-result/consume]
+    [(and (char? ch) (equal? ch #\i)) (forest-toggle-git-ignored!) event-result/consume]
+
     [(and (char? ch) (or (equal? ch #\+) (equal? ch #\=))) (forest-wider!) event-result/consume]
     [(and (char? ch) (equal? ch #\-)) (forest-narrower!) event-result/consume]
 
@@ -641,6 +708,7 @@
      (set! *forest-query* "")
      (set! *forest-search-results* '())
      (set! *forest-typing?* #f)
+     (forest-scan-git-ignored! (helix-find-workspace))
      (forest-reveal-current-file!)
      (forest-scan-files!)
      (push-component! (forest-make-bg-component))
@@ -651,6 +719,7 @@
 
     [else
      (set! *forest-focused* #t)
+     (forest-scan-git-ignored! (helix-find-workspace))
      (forest-reveal-current-file!)
      (push-component! (forest-make-fg-component))]))
 
@@ -667,7 +736,11 @@
 
 (define (forest-mini-list-dir path)
   (define children
-    (filter (lambda (p) (not (hashset-contains? *forest-ignore-set* (file-name p))))
+    (filter (lambda (p)
+              (define name (file-name p))
+              (not (or (hashset-contains? *forest-ignore-set* name)
+                       (and (not *forest-show-hidden*) (forest-dotfile? name))
+                       (and (not *forest-show-git-ignored*) (forest-git-ignored? p)))))
             (with-handler (lambda (_) '()) (read-dir path))))
   (map (lambda (p) (cons p (file-name p))) (forest-sort-entries children)))
 
@@ -728,6 +801,17 @@
   (set! *forest-mini-stack*
         (append (forest-mini-drop-last *forest-mini-stack*)
                 (list (ForestMiniColumn (ForestMiniColumn-path col) new-entries (box new-cursor))))))
+
+;; refesh after toggle
+(define (forest-mini-refresh-all!)
+  (set! *forest-mini-stack*
+        (map (lambda (col)
+               (define new-entries (forest-mini-list-dir (ForestMiniColumn-path col)))
+               (define new-cursor (max 0 (min (forest-mini-cursor col) (- (length new-entries) 1))))
+               (ForestMiniColumn (ForestMiniColumn-path col) new-entries (box new-cursor)))
+             *forest-mini-stack*)))
+
+(set! *forest-refresh-mini-fn* forest-mini-refresh-all!)
 
 (define (forest-mini-index-of lst target)
   (let loop ([l lst] [i 0])
@@ -1059,6 +1143,9 @@
     [(and (char? ch) (equal? ch #\R)) (forest-mini-refresh-active!) event-result/consume]
     [(and (char? ch) (equal? ch #\/)) (forest-mini-prompt-search!) event-result/consume]
 
+    [(and (char? ch) (equal? ch #\g)) (forest-toggle-hidden!) event-result/consume]
+    [(and (char? ch) (equal? ch #\i)) (forest-toggle-git-ignored!) event-result/consume]
+
     [(and (char? ch) (or (equal? ch #\+) (equal? ch #\=))) (forest-mini-wider!) event-result/consume]
     [(and (char? ch) (equal? ch #\-)) (forest-mini-narrower!) event-result/consume]
 
@@ -1070,6 +1157,7 @@
 (define (forest-mini-open!)
   (cond
     [(not *forest-active*)
+     (forest-scan-git-ignored! (helix-find-workspace))
      (set! *forest-mini-stack* (forest-mini-reveal-current-file!))
      (set! *forest-active* #t)
      (push-component! (forest-mini-make-component))]
