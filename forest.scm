@@ -36,11 +36,19 @@
 
 (provide forest-open)
 (provide forest-configure!)
+(provide forest-set-style!)
 
 ;;@doc
 ;; Set whic side the file tree renders on
 (define (forest-configure! side)
   (set! *forest-side* side))
+
+(define *forest-style* 'snacks)
+
+;;@doc
+;; Pick which explorer UI forest-open uses: 'snacks or 'mini
+(define (forest-set-style! style)
+  (set! *forest-style* style))
 
 (define (forest-take lst n)
   (if (or (null? lst) (<= n 0)) '() (cons (car lst) (forest-take (cdr lst) (- n 1)))))
@@ -617,9 +625,7 @@
                   (hash "handle_event" forest-handle-event-fg
                         "cursor" forest-cursor-fn-fg)))
 
-;;@doc
-;; Open the file tree
-(define (forest-open)
+(define (forest-snacks-open!)
   (cond
     [(not *forest-active*)
      (set! *forest-active* #t)
@@ -641,3 +647,315 @@
      (set! *forest-focused* #t)
      (forest-reveal-current-file!)
      (push-component! (forest-make-fg-component))]))
+
+(define *forest-mini-min-w* 14)
+(define *forest-mini-max-w* 40)
+(define *forest-mini-min-h* 3)
+(define *forest-mini-max-h* 24)
+(define *forest-mini-gap* 0)
+(define *forest-mini-margin* 1)
+
+(define *forest-mini-stack* '()) ; list of columns, oldest first and active last
+
+(struct ForestMiniColumn (path entries cursor))
+
+(define (forest-mini-list-dir path)
+  (define children
+    (filter (lambda (p) (not (hashset-contains? *forest-ignore-set* (file-name p))))
+            (with-handler (lambda (_) '()) (read-dir path))))
+  (map (lambda (p) (cons p (file-name p))) (forest-sort-entries children)))
+
+(define (forest-mini-cursor col) (unbox (ForestMiniColumn-cursor col)))
+(define (forest-mini-set-cursor! col v) (set-box! (ForestMiniColumn-cursor col) v))
+
+(define (forest-mini-last lst)
+  (if (null? (cdr lst)) (car lst) (forest-mini-last (cdr lst))))
+
+(define (forest-mini-drop-last lst)
+  (if (null? (cdr lst)) '() (cons (car lst) (forest-mini-drop-last (cdr lst)))))
+
+(define (forest-mini-active-column) (forest-mini-last *forest-mini-stack*))
+
+(define (forest-mini-current-entry)
+  (define col (forest-mini-active-column))
+  (define entries (ForestMiniColumn-entries col))
+  (and (not (null? entries)) (list-ref entries (forest-mini-cursor col))))
+
+(define (forest-mini-move! delta)
+  (define col (forest-mini-active-column))
+  (define n (length (ForestMiniColumn-entries col)))
+  (when (> n 0)
+    (forest-mini-set-cursor! col (max 0 (min (- n 1) (+ (forest-mini-cursor col) delta))))))
+
+(define (forest-mini-close!)
+  (set! *forest-active* #f)
+  (pop-last-component-by-name! "forest-mini"))
+
+;; enters a directory cascades a new column to the side or opens a file
+(define (forest-mini-enter!)
+  (define entry (forest-mini-current-entry))
+  (cond
+    [(not entry) event-result/consume]
+    [(is-dir? (car entry))
+     (set! *forest-mini-stack*
+           (append *forest-mini-stack*
+                   (list (ForestMiniColumn (car entry) (forest-mini-list-dir (car entry)) (box 0)))))
+     event-result/consume]
+    [(is-file? (car entry))
+     (define path (car entry))
+     (forest-mini-close!)
+     (enqueue-thread-local-callback (lambda () (helix.open path)))
+     event-result/close]
+    [else event-result/consume]))
+
+;; steps back to the parent column
+(define (forest-mini-back!)
+  (when (> (length *forest-mini-stack*) 1)
+    (set! *forest-mini-stack* (forest-mini-drop-last *forest-mini-stack*))))
+
+(define (forest-mini-index-of lst target)
+  (let loop ([l lst] [i 0])
+    (cond
+      [(null? l) #f]
+      [(equal? (car l) target) i]
+      [else (loop (cdr l) (+ i 1))])))
+
+;; path segments below root
+(define (forest-mini-relative-components root path)
+  (define prefix (string-append root (path-separator)))
+  (if (and (>= (string-length path) (string-length prefix))
+           (equal? (substring path 0 (string-length prefix)) prefix))
+      (split-many (substring path (string-length prefix) (string-length path)) (path-separator))
+      '()))
+
+;; cascades a column per ancestor from root down to path
+(define (forest-mini-build-stack-for root path)
+  (let loop ([dir root] [comps (forest-mini-relative-components root path)] [acc '()])
+    (define entries (forest-mini-list-dir dir))
+    (cond
+      [(null? comps) (reverse (cons (ForestMiniColumn dir entries (box 0)) acc))]
+      [else
+       (define idx (forest-mini-index-of (map cdr entries) (car comps)))
+       (define col (ForestMiniColumn dir entries (box (if idx idx 0))))
+       (if (and idx (pair? (cdr comps)))
+           (loop (car (list-ref entries idx)) (cdr comps) (cons col acc))
+           (reverse (cons col acc)))])))
+
+;; expands ancestors down to whatever file the editor has focused
+(define (forest-mini-reveal-current-file!)
+  (define root (helix-find-workspace))
+  (define path (editor-document->path (editor->doc-id (editor-focus))))
+  (if (string? path)
+      (forest-mini-build-stack-for root path)
+      (list (ForestMiniColumn root (forest-mini-list-dir root) (box 0)))))
+
+;; panels grow and shrink with their own content with safe bound clamping
+(define (forest-mini-longest-name entries)
+  (let loop ([lst entries] [best 0])
+    (if (null? lst) best (loop (cdr lst) (max best (string-length (cdr (car lst))))))))
+
+(define *forest-mini-width-boost* 0)
+
+(define (forest-mini-col-width entries)
+  (min *forest-mini-max-w* (max *forest-mini-min-w* (+ (forest-mini-longest-name entries) 4 *forest-mini-width-boost*))))
+
+(define (forest-mini-col-height count max-h)
+  (min max-h (max *forest-mini-min-h* count)))
+
+;; no explicit redraw, consuming the event already re-renders
+(define (forest-mini-wider!)
+  (set! *forest-mini-width-boost* (min 40 (+ *forest-mini-width-boost* 4))))
+
+(define (forest-mini-narrower!)
+  (set! *forest-mini-width-boost* (max (- *forest-mini-min-w*) (- *forest-mini-width-boost* 4))))
+
+;; centers the cursor within a column's visible window
+(define (forest-mini-window-start cursor count height)
+  (define max-start (max 0 (- count height)))
+  (max 0 (min max-start (- cursor (quotient height 2)))))
+
+(define *forest-mini-preview-max-lines* 200)
+(define *forest-mini-preview-min-w* 15)
+(define *forest-mini-preview-max-w* 70)
+
+(define (forest-mini-preview-lines path max-lines)
+  (with-handler
+    (lambda (_) (list "(unable to preview)"))
+    (let* ([p (open-input-file path)]
+           [content (read-port-to-string p)])
+      (close-input-port p)
+      (forest-take (split-many content "\n") max-lines))))
+
+(define (forest-mini-longest-line lines cap)
+  (let loop ([lst lines] [best 0])
+    (if (null? lst) best (loop (cdr lst) (max best (min cap (string-length (car lst))))))))
+
+(define (forest-mini-preview)
+  (define entry (forest-mini-current-entry))
+  (cond
+    [(not entry) (list 'empty #f)]
+    [(is-dir? (car entry)) (list 'dir (forest-mini-list-dir (car entry)))]
+    [(is-file? (car entry)) (list 'file (forest-mini-preview-lines (car entry) *forest-mini-preview-max-lines*))]
+    [else (list 'empty #f)]))
+
+(struct ForestMiniState ())
+
+(define (forest-mini-render-entries frame x y0 w h entries ws cursor active?
+                               text-style hl-style dir-style dim-style)
+  (if (null? entries)
+      (frame-set-string! frame x y0 (forest-truncate "(empty)" w) dim-style)
+      (let iloop ([items (forest-take (forest-drop entries ws) h)] [row 0])
+        (unless (or (null? items) (>= row h))
+          (define e (car items))
+          (define idx (+ ws row))
+          (define dir? (is-dir? (car e)))
+          (define hl? (and active? (= idx cursor)))
+          (define icon (if dir? (glyph-dir-icon (cdr e)) (glyph-icon (cdr e))))
+          (define icon-color (if dir? (glyph-dir-color (cdr e)) (glyph-color (cdr e))))
+          (define row-style (cond [hl? hl-style] [dir? dir-style] [else text-style]))
+          (define name (string-append (cdr e) (if dir? (path-separator) "")))
+          (define icon-w (string-length icon))
+          (define name-x (+ x icon-w 1))
+          (define avail (max 0 (- w icon-w 1)))
+          (define y (+ y0 row))
+          (when hl? (frame-set-string! frame x y (make-string w #\space) hl-style))
+          (frame-set-string! frame x y icon (glyph-style icon-color #:base row-style))
+          (frame-set-string! frame name-x y (forest-truncate name avail) row-style)
+          (iloop (cdr items) (+ row 1))))))
+
+;; file-preview panel in plain text
+(define (forest-mini-render-lines frame x y0 w h lines style)
+  (let iloop ([items (forest-take lines h)] [row 0])
+    (unless (or (null? items) (>= row h))
+      (frame-set-string! frame x (+ y0 row) (forest-truncate (car items) w) style)
+      (iloop (cdr items) (+ row 1)))))
+
+(define (forest-mini-render state rect frame)
+  (define sw (area-width rect))
+  (define sh (area-height rect))
+  (define max-h (min *forest-mini-max-h* (max *forest-mini-min-h* (- sh 4))))
+
+  (define bg-style (theme-scope-ref "ui.background"))
+  (define text-style (theme-scope-ref "ui.text"))
+  (define hl-style (theme-scope-ref "ui.menu.selected"))
+  (define dir-style (theme-scope-ref "ui.text.info"))
+  (define dim-style (style-with-dim (theme-scope-ref "ui.text")))
+  (define border-style (style-with-bold (theme-scope-ref "ui.statusline.normal")))
+
+  (define active-col (forest-mini-active-column))
+
+  (define col-specs
+    (map (lambda (col)
+           (define entries (ForestMiniColumn-entries col))
+           (list 'col col (forest-mini-col-width entries) (forest-mini-col-height (length entries) max-h)))
+         *forest-mini-stack*))
+
+  (define preview (forest-mini-preview))
+  (define preview-kind (car preview))
+  (define preview-data (cadr preview))
+  (define preview-spec
+    (cond
+      [(equal? preview-kind 'dir)
+       (list 'preview-dir preview-data
+             (forest-mini-col-width preview-data) (forest-mini-col-height (length preview-data) max-h))]
+      [(equal? preview-kind 'file)
+       (list 'preview-file preview-data
+             (min *forest-mini-preview-max-w*
+                  (max *forest-mini-preview-min-w*
+                       (+ (forest-mini-longest-line preview-data *forest-mini-preview-max-w*) 4 *forest-mini-width-boost*)))
+             (forest-mini-col-height (length preview-data) max-h))]
+      [else (list 'preview-empty #f *forest-mini-min-w* *forest-mini-min-h*)]))
+
+  (define all-specs (append col-specs (list preview-spec)))
+
+  (define (total-width specs)
+    (+ (apply + (map (lambda (s) (+ (list-ref s 2) 2)) specs))
+       (* *forest-mini-gap* (max 0 (- (length specs) 1)))))
+
+  ;; drop the oldest ancestor columns first if the stack is wider than the screen
+  (define (fit specs)
+    (if (or (<= (total-width specs) (- sw 2)) (<= (length specs) 2))
+        specs
+        (fit (cdr specs))))
+  (define visible (fit all-specs))
+
+  ;; anchor at a top corner
+  (define x0 (if (equal? *forest-side* 'right)
+                 (max 0 (- sw (total-width visible) *forest-mini-margin*))
+                 *forest-mini-margin*))
+  (define y0 *forest-mini-margin*)
+
+  (let loop ([lst visible] [x x0])
+    (unless (null? lst)
+      (define spec (car lst))
+      (define kind (list-ref spec 0))
+      (define w (list-ref spec 2))
+      (define h (list-ref spec 3))
+      (define pw (+ w 2))
+      (define ph (+ h 2))
+      (define panel-area (area x y0 pw ph))
+      (define cx (+ x 1))
+      (define cy (+ y0 1))
+
+      (buffer/clear-with frame panel-area bg-style)
+      (block/render frame panel-area (make-block bg-style border-style "all" "rounded"))
+
+      (cond
+        [(equal? kind 'col)
+         (define col (list-ref spec 1))
+         (define entries (ForestMiniColumn-entries col))
+         (define cursor (forest-mini-cursor col))
+         (define active? (equal? col active-col))
+         (define ws (forest-mini-window-start cursor (length entries) h))
+         (forest-mini-render-entries frame cx cy w h entries ws cursor active?
+                                text-style hl-style dir-style dim-style)]
+        [(equal? kind 'preview-dir)
+         (forest-mini-render-entries frame cx cy w h (list-ref spec 1) 0 -1 #f
+                                text-style hl-style dir-style dim-style)]
+        [(equal? kind 'preview-file)
+         (forest-mini-render-lines frame cx cy w h (list-ref spec 1) dim-style)]
+        [else
+         (frame-set-string! frame cx cy (forest-truncate "(empty)" w) dim-style)])
+
+      (loop (cdr lst) (+ x pw *forest-mini-gap*)))))
+
+(define (forest-mini-handle-event state event)
+  (define ch (key-event-char event))
+  (cond
+    [(key-event-down? event) (forest-mini-move! 1) event-result/consume]
+    [(key-event-up? event) (forest-mini-move! -1) event-result/consume]
+    [(and (char? ch) (equal? ch #\j)) (forest-mini-move! 1) event-result/consume]
+    [(and (char? ch) (equal? ch #\k)) (forest-mini-move! -1) event-result/consume]
+
+    [(or (key-event-right? event) (key-event-enter? event) (and (char? ch) (equal? ch #\l)))
+     (forest-mini-enter!)]
+    [(or (key-event-left? event) (and (char? ch) (equal? ch #\h)))
+     (forest-mini-back!)
+     event-result/consume]
+
+    [(or (key-event-escape? event) (and (char? ch) (equal? ch #\q)))
+     (forest-mini-close!)
+     event-result/close]
+
+    [(and (char? ch) (or (equal? ch #\+) (equal? ch #\=))) (forest-mini-wider!) event-result/consume]
+    [(and (char? ch) (equal? ch #\-)) (forest-mini-narrower!) event-result/consume]
+
+    [else event-result/consume]))
+
+(define (forest-mini-make-component)
+  (new-component! "forest-mini" (ForestMiniState) forest-mini-render (hash "handle_event" forest-mini-handle-event)))
+
+(define (forest-mini-open!)
+  (cond
+    [(not *forest-active*)
+     (set! *forest-mini-stack* (forest-mini-reveal-current-file!))
+     (set! *forest-active* #t)
+     (push-component! (forest-mini-make-component))]
+    [else (forest-mini-close!)]))
+
+;;@doc
+;; Open the file tree
+(define (forest-open)
+  (if (equal? *forest-style* 'mini)
+      (forest-mini-open!)
+      (forest-snacks-open!)))
