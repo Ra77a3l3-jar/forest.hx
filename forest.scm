@@ -38,30 +38,57 @@
     (and (Ok? proc)
          (string=? (trim (read-port-to-string (child-stdout (Ok->value proc)))) "true"))))
 
-;; recomputes the set of workspace-relative paths git considers ignored
+(define *forest-git-status-map* (hash))
+
+;; classifies code it modifiles added deleted and renames
+(define (forest-git-status-symbol code)
+  (define x (string-ref code 0))
+  (define y (string-ref code 1))
+  (cond
+    [(and (char=? x #\?) (char=? y #\?)) 'untracked]
+    [(or (char=? x #\A) (char=? y #\A)) 'added]
+    [(or (char=? x #\D) (char=? y #\D)) 'deleted]
+    [(or (char=? x #\R) (char=? y #\R)) 'renamed]
+    [(or (char=? x #\M) (char=? y #\M)) 'modified]
+    [else #f]))
+
+(define (forest-status-path rest)
+  (define parts (split-many rest " -> "))
+  (trim-end-matches (if (> (length parts) 1) (list-ref parts (- (length parts) 1)) rest)
+                     (path-separator)))
+
+(define (forest-parse-git-status-lines lines)
+  (let loop ([ls lines] [ign (hashset)] [statuses (hash)])
+    (if (null? ls)
+        (cons ign statuses)
+        (let ([line (car ls)])
+          (if (< (string-length line) 3)
+              (loop (cdr ls) ign statuses)
+              (let* ([code (substring line 0 2)]
+                     [path (forest-status-path (trim (substring line 3 (string-length line))))])
+                (if (string=? code "!!")
+                    (loop (cdr ls) (hashset-insert ign path) statuses)
+                    (let ([sym (forest-git-status-symbol code)])
+                      (loop (cdr ls) ign (if sym (hash-insert statuses path sym) statuses))))))))))
+
+;; recomputes which workspace-relative paths git considers ignored
 (define (forest-scan-git-ignored! root)
-  (set! *forest-git-ignored-set*
-        (with-handler
-          (lambda (_) (hashset))
-          (if (not (forest-git-repo? root))
-              (hashset)
-              (let ([proc (~> (command "git" (list "-C" root "status" "--porcelain" "--ignored=matching"))
-                              with-stdout-piped
-                              with-stderr-piped
-                              spawn-process)])
-                (if (Ok? proc)
-                    (let* ([output (read-port-to-string (child-stdout (Ok->value proc)))]
-                           [lines (filter (lambda (l) (> (string-length l) 0)) (split-many output "\n"))])
-                      (apply hashset
-                             (filter (lambda (x) x)
-                                     (map (lambda (line)
-                                            (and (>= (string-length line) 3)
-                                                 (string=? (substring line 0 2) "!!")
-                                                 (trim-end-matches
-                                                  (trim (substring line 3 (string-length line)))
-                                                  (path-separator))))
-                                          lines))))
-                    (hashset)))))))
+  (define parsed
+    (with-handler
+      (lambda (_) (cons (hashset) (hash)))
+      (if (not (forest-git-repo? root))
+          (cons (hashset) (hash))
+          (let ([proc (~> (command "git" (list "-C" root "status" "--porcelain" "--ignored=matching"))
+                          with-stdout-piped
+                          with-stderr-piped
+                          spawn-process)])
+            (if (Ok? proc)
+                (let* ([output (read-port-to-string (child-stdout (Ok->value proc)))]
+                       [lines (filter (lambda (l) (> (string-length l) 0)) (split-many output "\n"))])
+                  (forest-parse-git-status-lines lines))
+                (cons (hashset) (hash)))))))
+  (set! *forest-git-ignored-set* (car parsed))
+  (set! *forest-git-status-map* (cdr parsed)))
 
 (define *forest-active* #f)
 (define *forest-focused* #f)
@@ -80,9 +107,11 @@
 (provide forest-set-style!)
 
 ;;@doc
-;; Set whic side the file tree renders on
-(define (forest-configure! side)
-  (set! *forest-side* side))
+;; Set which side the file tree renders, and hiddent entries
+(define (forest-configure! side
+                            #:ignore [ignore (list )])
+  (set! *forest-side* side)
+  (set! *forest-ignore-set* (apply hashset ignore)))
 
 (define *forest-style* 'snacks)
 
@@ -115,6 +144,9 @@
 
 (define (forest-git-ignored? path)
   (hashset-contains? *forest-git-ignored-set* (forest-relpath path)))
+
+(define (forest-git-status path)
+  (hash-try-get *forest-git-status-map* (forest-relpath path)))
 
 (define (forest-searching?) (not (equal? *forest-query* "")))
 
@@ -562,15 +594,21 @@
                 (define rel (car items))
                 (define icon (glyph-icon (file-name rel)))
                 (define icon-color (glyph-color (file-name rel)))
+                (define git-status (forest-git-status rel))
+                (define git-icon (if git-status (glyph-git-icon git-status) " "))
+                (define git-color (if git-status (glyph-git-color git-status) #f))
                 (define y (+ list-y0 row))
                 (define hl? (= abs-idx *forest-cursor*))
                 (define row-style (if hl? hl-style text-style))
                 (define icon-w (string-length icon))
-                (define text-x (+ x0 icon-w 1))
-                (define avail (max 0 (- max-text-w icon-w 1)))
+                (define git-x (+ x0 icon-w 1))
+                (define text-x (+ git-x 1 1))
+                (define avail (max 0 (- max-text-w icon-w 1 1 1)))
                 (when hl?
                   (frame-set-string! frame x0 y (make-string w #\space) hl-style))
                 (frame-set-string! frame x0 y icon (glyph-style icon-color #:base row-style))
+                (frame-set-string! frame git-x y git-icon
+                                    (if git-color (glyph-style git-color #:base row-style) row-style))
                 (frame-set-string! frame text-x y (forest-truncate rel avail) row-style)
                 (loop (cdr items) (+ row 1))))))
       (let ([visible (forest-take (forest-drop *forest-tree* *forest-window-start*)
@@ -587,17 +625,26 @@
             (define dir? (is-dir? path))
             (define icon (if dir? (glyph-dir-icon name) (glyph-icon name)))
             (define icon-color (if dir? (glyph-dir-color name) (glyph-color name)))
+            (define git-status (and (not dir?) (forest-git-status path)))
+            (define git-icon (if git-status (glyph-git-icon git-status) " "))
+            (define git-color (if git-status (glyph-git-color git-status) #f))
             (define y (+ list-y0 row))
             (define hl? (= abs-idx *forest-cursor*))
             (define row-style (cond [hl? hl-style] [dir? dir-style] [else text-style]))
             (define prefix-w (string-length prefix))
             (define icon-w (string-length icon))
-            (define name-x (+ x0 prefix-w icon-w 1))
-            (define avail (max 0 (- max-text-w prefix-w icon-w 1)))
+            (define git-x (+ x0 prefix-w icon-w 1))
+            (define git-w (if dir? 0 1))
+            (define gap (if dir? 0 1))
+            (define name-x (+ git-x git-w gap))
+            (define avail (max 0 (- max-text-w prefix-w icon-w 1 git-w gap)))
             (when hl?
               (frame-set-string! frame x0 y (make-string w #\space) hl-style))
             (frame-set-string! frame x0 y prefix row-style)
             (frame-set-string! frame (+ x0 prefix-w) y icon (glyph-style icon-color #:base row-style))
+            (unless dir?
+              (frame-set-string! frame git-x y git-icon
+                                  (if git-color (glyph-style git-color #:base row-style) row-style)))
             (frame-set-string! frame name-x y (forest-truncate name avail) row-style)
             (loop (cdr items) (+ row 1)))))))
 
@@ -1010,14 +1057,23 @@
           (define hl? (and active? (= idx cursor)))
           (define icon (if dir? (glyph-dir-icon (cdr e)) (glyph-icon (cdr e))))
           (define icon-color (if dir? (glyph-dir-color (cdr e)) (glyph-color (cdr e))))
+          (define git-status (and (not dir?) (forest-git-status (car e))))
+          (define git-icon (if git-status (glyph-git-icon git-status) " "))
+          (define git-color (if git-status (glyph-git-color git-status) #f))
           (define row-style (cond [hl? hl-style] [dir? dir-style] [else text-style]))
           (define name (string-append (cdr e) (if dir? (path-separator) "")))
           (define icon-w (string-length icon))
-          (define name-x (+ x icon-w 1))
-          (define avail (max 0 (- w icon-w 1)))
+          (define git-x (+ x icon-w 1))
+          (define git-w (if dir? 0 1))
+          (define gap (if dir? 0 1))
+          (define name-x (+ git-x git-w gap))
+          (define avail (max 0 (- w icon-w 1 git-w gap)))
           (define y (+ y0 row))
           (when hl? (frame-set-string! frame x y (make-string w #\space) hl-style))
           (frame-set-string! frame x y icon (glyph-style icon-color #:base row-style))
+          (unless dir?
+            (frame-set-string! frame git-x y git-icon
+                                (if git-color (glyph-style git-color #:base row-style) row-style)))
           (frame-set-string! frame name-x y (forest-truncate name avail) row-style)
           (iloop (cdr items) (+ row 1))))))
 
