@@ -30,9 +30,9 @@ forge pkg install --git https://github.com/Ra77a3l3-jar/forest.hx.git
 ```scheme
 (require "forest/forest.scm")
 
-;; Optional: which side the tree renders on ('left by default)
-;; (forest-configure! side)
-(forest-configure! 'left)
+;; Optional: which side the tree renders on ('left by default), and which
+;; entry names are always hidden 
+(forest-configure! 'left #:ignore (list ".git" "target" "__pycache__"))
 
 ;; Optional: which explorer UI forest-open uses ('snacks by default)
 ;; (forest-set-style! style)
@@ -92,4 +92,4 @@ Opening the tree reveals whatever file is currently open in the editor, cascadin
 ## Notes
 
 - Requires [notify.hx](https://github.com/chuwy/notify.hx) (pulled in automatically as a dependency) for create/rename/delete notifications.
-- `.git`, `target`, `.direnv`, `node_modules`, `__pycache__`, and `.hg` are always hidden regardless of the `g`/`i` toggles. Dotfiles and git-ignored entries are hidden by default in both styles.
+- Uses [glyph.hx](https://github.com/Ra77a3l3-jar/glyph.hx) for all the diffrent icons.
