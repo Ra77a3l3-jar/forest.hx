@@ -1094,7 +1094,8 @@
   (define hl-style (theme-scope-ref "ui.menu.selected"))
   (define dir-style (theme-scope-ref "ui.text.info"))
   (define dim-style (style-with-dim (theme-scope-ref "ui.text")))
-  (define border-style (style-with-bold (theme-scope-ref "ui.statusline.normal")))
+  ;; border matches bg so it blends in instead of clashing across themes
+  (define border-style bg-style)
 
   (define active-col (forest-mini-active-column))
 
