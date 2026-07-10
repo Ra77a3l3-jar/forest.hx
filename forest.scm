@@ -218,10 +218,11 @@
   (define path (editor-document->path (editor->doc-id (editor-focus))))
   (forest-open-ancestors-for-file! path)
   (forest-build-tree!)
-  (forest-seek-file! path))
+  (unless (forest-searching?)
+    (forest-seek-file! path)))
 
 ;; flat recursive file list for search
-;; researches files independent of the fold state
+;; searches files indepedent of the fold state
 (define (forest-scan-files!)
   (define root (helix-find-workspace))
   (define root-prefix (string-append root (path-separator)))
@@ -556,6 +557,70 @@
 (define (forest-panel-x0 rect w)
   (if (equal? *forest-side* 'right) (- (area-width rect) w) 0))
 
+(define *forest-query-prefix* "> ")
+
+(define (forest-match-positions name query)
+  (let loop ([ns (string->list (string-downcase name))]
+             [qs (string->list (string-downcase query))]
+             [i 0]
+             [acc '()])
+    (cond
+      [(or (null? qs) (null? ns)) (reverse acc)]
+      [(char=? (car ns) (car qs)) (loop (cdr ns) (cdr qs) (+ i 1) (cons i acc))]
+      [else (loop (cdr ns) qs (+ i 1) acc)])))
+
+(define (forest-match-style base)
+  (define c (style->fg (theme-scope-ref "special")))
+  (style-with-bold (if c (style-fg base c) base)))
+
+(define (forest-render-name-hl frame x y name avail base-style match-style positions)
+  (define truncated (forest-truncate name avail))
+  (define tlen (string-length truncated))
+  (define pset (let loop ([ps positions] [acc (hashset)])
+                 (if (null? ps) acc (loop (cdr ps) (hashset-insert acc (car ps))))))
+  (let loop ([i 0])
+    (when (< i tlen)
+      (define on? (hashset-contains? pset i))
+      (define j (let scan ([k (+ i 1)])
+                  (if (and (< k tlen) (equal? (hashset-contains? pset k) on?)) (scan (+ k 1)) k)))
+      (frame-set-string! frame (+ x i) y (substring truncated i j) (if on? match-style base-style))
+      (loop j))))
+
+;; inserts one matched relative path into the merged ancestor tree
+(define (forest-search-tree-insert node segs)
+  (define seg (car segs))
+  (define rest (cdr segs))
+  (if (null? rest)
+      (hash-insert node seg #t)
+      (let* ([existing (hash-try-get node seg)]
+             [child (if (hash? existing) existing (hash))])
+        (hash-insert node seg (forest-search-tree-insert child rest)))))
+
+(define (forest-search-build-tree matches)
+  (let loop ([ms matches] [root (hash)])
+    (if (null? ms)
+        root
+        (loop (cdr ms) (forest-search-tree-insert root (split-many (car ms) (path-separator)))))))
+
+;; depth 0 sits flush like the normal browsing view, nested levels are just indented
+(define (forest-search-flatten node path depth)
+  (define keys (hash-keys->list node))
+  (define dirs (sort (filter (lambda (k) (hash? (hash-try-get node k))) keys) string<?))
+  (define files (sort (filter (lambda (k) (not (hash? (hash-try-get node k)))) keys) string<?))
+  (define ordered (append dirs files))
+  (let loop ([items ordered])
+    (if (null? items)
+        '()
+        (let* ([name (car items)]
+               [val (hash-try-get node name)]
+               [dir? (hash? val)]
+               [own (forest-repeat-str "  " depth)]
+               [rel (if (equal? path "") name (string-append path (path-separator) name))]
+               [entry (list own dir? name rel)])
+          (append (list entry)
+                  (if dir? (forest-search-flatten val rel (+ depth 1)) '())
+                  (loop (cdr items)))))))
+
 (define (forest-render-bg state rect frame)
   (define w (min *forest-width* (area-width rect)))
   (define h (area-height rect))
@@ -578,7 +643,22 @@
 
   (define search-area (area x0 0 w *forest-search-height*))
   (block/render frame search-area (make-block bg-style bg-style "all" "rounded"))
-  (frame-set-string! frame (+ x0 1) 1 (forest-truncate *forest-query* (- w 2)) text-style)
+
+  (define title "Explorer")
+  (when (> w (+ (string-length title) 4))
+    (frame-set-string! frame (+ x0 (quotient (- w (string-length title)) 2)) 0
+                        title (style-with-bold dir-style)))
+
+  (define prompt (string-append *forest-query-prefix* *forest-query*))
+  (define prompt-shown (forest-truncate prompt (- w 2)))
+  (frame-set-string! frame (+ x0 1) 1 prompt-shown text-style)
+
+  (when (forest-searching?)
+    (define counter (string-append (number->string (length *forest-search-results*))
+                                    "/" (number->string (length *forest-all-files*))))
+    (define counter-x (- (+ x0 w) 1 (string-length counter)))
+    (when (>= counter-x (+ x0 2 (string-length prompt-shown)))
+      (frame-set-string! frame counter-x 1 counter dim-style)))
 
   (define list-y0 *forest-search-height*)
   (define max-text-w (- w 1))
@@ -586,30 +666,50 @@
   (if (forest-searching?)
       (if (null? *forest-search-results*)
           (frame-set-string! frame (+ x0 1) list-y0 "(no matches)" dim-style)
-          (let ([visible (forest-take (forest-drop *forest-search-results* *forest-window-start*)
-                                       *forest-visible-height*)])
+          (let* ([tree (forest-search-build-tree *forest-search-results*)]
+                 [rows (forest-search-flatten tree "" 0)]
+                 [selected-rel (list-ref *forest-search-results* *forest-cursor*)]
+                 [selected-row (let loop ([rs rows] [i 0])
+                                 (cond [(null? rs) 0]
+                                       [(and (not (list-ref (car rs) 1)) (equal? (list-ref (car rs) 3) selected-rel)) i]
+                                       [else (loop (cdr rs) (+ i 1))]))]
+                 [total-rows (length rows)]
+                 [window-start (max 0 (min (max 0 (- total-rows *forest-visible-height*))
+                                            (max 0 (- selected-row (forest-half-floor *forest-visible-height*)))))]
+                 [visible (forest-take (forest-drop rows window-start) *forest-visible-height*)])
             (let loop ([items visible] [row 0])
               (unless (or (null? items) (>= row *forest-visible-height*))
-                (define abs-idx (+ *forest-window-start* row))
-                (define rel (car items))
-                (define icon (glyph-icon (file-name rel)))
-                (define icon-color (glyph-color (file-name rel)))
-                (define git-status (forest-git-status rel))
+                (define entry (car items))
+                (define own-prefix (list-ref entry 0))
+                (define dir? (list-ref entry 1))
+                (define name (list-ref entry 2))
+                (define rel (list-ref entry 3))
+                (define icon (if dir? (glyph-dir-icon name) (glyph-icon name)))
+                (define icon-color (if dir? (glyph-dir-color name) (glyph-color name)))
+                (define git-status (and (not dir?) (forest-git-status rel)))
                 (define git-icon (if git-status (glyph-git-icon git-status) " "))
                 (define git-color (if git-status (glyph-git-color git-status) #f))
                 (define y (+ list-y0 row))
-                (define hl? (= abs-idx *forest-cursor*))
-                (define row-style (if hl? hl-style text-style))
+                (define hl? (and (not dir?) (equal? rel selected-rel)))
+                (define row-style (cond [hl? hl-style] [dir? dir-style] [else text-style]))
+                (define prefix-w (string-length own-prefix))
                 (define icon-w (string-length icon))
-                (define git-x (+ x0 icon-w 1))
-                (define text-x (+ git-x 1 1))
-                (define avail (max 0 (- max-text-w icon-w 1 1 1)))
+                (define git-x (+ x0 prefix-w icon-w 1))
+                (define git-w (if dir? 0 1))
+                (define gap (if dir? 0 1))
+                (define name-x (+ git-x git-w gap))
+                (define avail (max 0 (- max-text-w prefix-w icon-w 1 git-w gap)))
+                (define positions (and (not dir?) (forest-match-positions name *forest-query*)))
                 (when hl?
                   (frame-set-string! frame x0 y (make-string w #\space) hl-style))
-                (frame-set-string! frame x0 y icon (glyph-style icon-color #:base row-style))
-                (frame-set-string! frame git-x y git-icon
-                                    (if git-color (glyph-style git-color #:base row-style) row-style))
-                (frame-set-string! frame text-x y (forest-truncate rel avail) row-style)
+                (frame-set-string! frame x0 y own-prefix row-style)
+                (frame-set-string! frame (+ x0 prefix-w) y icon (glyph-style icon-color #:base row-style))
+                (unless dir?
+                  (frame-set-string! frame git-x y git-icon
+                                      (if git-color (glyph-style git-color #:base row-style) row-style)))
+                (if (and positions (pair? positions))
+                    (forest-render-name-hl frame name-x y name avail row-style (forest-match-style row-style) positions)
+                    (frame-set-string! frame name-x y (forest-truncate name avail) row-style))
                 (loop (cdr items) (+ row 1))))))
       (let ([visible (forest-take (forest-drop *forest-tree* *forest-window-start*)
                                    *forest-visible-height*)])
@@ -661,15 +761,17 @@
   (if *forest-typing?*
       (let* ([w (min *forest-width* (area-width area))]
              [x0 (forest-panel-x0 area w)])
-        (position 1 (+ x0 1 (string-length *forest-query*))))
+        (position 1 (+ x0 1 (string-length *forest-query-prefix*) (string-length *forest-query*))))
       #f))
 
 (define (forest-handle-event-typing state event)
   (define ch (key-event-char event))
   (cond
     [(key-event-enter? event)
+     ;; confirms the query without opening anything, so the matches can
+     ;; still be browsed with j/k before committing to one with a second enter
      (set! *forest-typing?* #f)
-     (forest-activate!)]
+     event-result/consume]
     [(key-event-escape? event)
      ;; leaves the filtered results in place
      ;; stops updating the query
