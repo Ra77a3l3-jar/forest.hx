@@ -18,6 +18,7 @@
 (define *forest-max-width* 60)
 (define *forest-search-height* 3)
 (define *forest-side* 'left) ; left or right set with forest-configure!
+(define *forest-show-separator?* #t)
 
 (define *forest-ignore-set*
   (hashset ".git" "target" ".direnv" "node_modules" "__pycache__" ".hg"))
@@ -146,11 +147,14 @@
               (loop (cdr ks) (hash-insert acc (car ks) (hash-try-get overrides (car ks))))))))
 
 ;;@doc
-;; Set which side the file tree renders, and hiddent entries
+;; Set which side the file tree renders, hidden entries, and whether a
+;; vertical separator line is drawn between the tree and the text buffer
 (define (forest-configure! side
-                            #:ignore [ignore (list )])
+                            #:ignore [ignore (list )]
+                            #:separator? [separator? #t])
   (set! *forest-side* side)
-  (set! *forest-ignore-set* (apply hashset ignore)))
+  (set! *forest-ignore-set* (apply hashset ignore))
+  (set! *forest-show-separator?* separator?))
 
 (define *forest-style* 'snacks)
 
@@ -680,8 +684,11 @@
   (define panel-area (area x0 0 w h))
   (buffer/clear-with frame panel-area bg-style)
 
+  ;; border matches bg so it blends in instead of clashing across themes;
+  (define border-style bg-style)
+
   (define search-area (area x0 0 w *forest-search-height*))
-  (block/render frame search-area (make-block bg-style bg-style "all" "rounded"))
+  (block/render frame search-area (make-block bg-style border-style "all" "rounded"))
 
   (define title "Explorer")
   (when (> w (+ (string-length title) 4))
@@ -698,6 +705,15 @@
     (define counter-x (- (+ x0 w) 1 (string-length counter)))
     (when (>= counter-x (+ x0 2 (string-length prompt-shown)))
       (frame-set-string! frame counter-x 1 counter dim-style)))
+
+  ;; full-height line marking the boundary with the text buffer
+  (when *forest-show-separator?*
+    (define sep-x (if (equal? *forest-side* 'right) (- x0 1) w))
+    (when (and (>= sep-x 0) (< sep-x (area-width rect)))
+      (let loop ([y 0])
+        (when (< y h)
+          (frame-set-string! frame sep-x y "│" border-style)
+          (loop (+ y 1))))))
 
   (define list-y0 *forest-search-height*)
   (define max-text-w (- w 1))
