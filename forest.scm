@@ -102,9 +102,48 @@
 (define *forest-search-results* '())
 (define *forest-typing?* #f)
 
+(define *forest-default-keybinds*
+  (hash 'down "j"
+        'up "k"
+        'enter "l" ; in mini, in addition to the right arrow/Enter
+        'back "h" ; in mini, addition to the left arrow
+        'search "/"
+        'create "n"
+        'rename "r"
+        'delete "d"
+        'refresh "R"
+        'toggle-hidden "."
+        'toggle-git-ignored "i"
+        'wider "+"
+        'narrower "-"
+        'quit "q"))
+
+(define *forest-keybinds* *forest-default-keybinds*)
+
+;; looks up which action (if any) a keypress is bound to
+(define (forest-action-for-char ch)
+  (define s (string ch))
+  (let loop ([ks (hash-keys->list *forest-keybinds*)])
+    (cond
+      [(null? ks) #f]
+      [(equal? (hash-try-get *forest-keybinds* (car ks)) s) (car ks)]
+      [else (loop (cdr ks))])))
+
 (provide forest-open)
+(provide forest-close)
 (provide forest-configure!)
 (provide forest-set-style!)
+(provide forest-set-keybinds!)
+
+;;@doc
+;; Override any subset of forest's keybindings from init.scm
+;; (forest-set-keybinds! (hash 'rename "R" 'refresh "r"))
+(define (forest-set-keybinds! overrides)
+  (set! *forest-keybinds*
+        (let loop ([ks (hash-keys->list overrides)] [acc *forest-keybinds*])
+          (if (null? ks)
+              acc
+              (loop (cdr ks) (hash-insert acc (car ks) (hash-try-get overrides (car ks))))))))
 
 ;;@doc
 ;; Set which side the file tree renders, and hiddent entries
@@ -785,6 +824,22 @@
      event-result/consume]
     [else event-result/consume]))
 
+(define (forest-command-action! action)
+  (cond
+    [(equal? action 'down) (forest-cursor-down!) event-result/consume]
+    [(equal? action 'up) (forest-cursor-up!) event-result/consume]
+    [(equal? action 'search) (forest-enter-search!) event-result/consume]
+    [(equal? action 'create) (forest-prompt-create!) event-result/consume]
+    [(equal? action 'rename) (forest-prompt-rename!) event-result/consume]
+    [(equal? action 'delete) (forest-prompt-delete!) event-result/consume]
+    [(equal? action 'refresh) (forest-refresh-all!) event-result/consume]
+    [(equal? action 'toggle-hidden) (forest-toggle-hidden!) event-result/consume]
+    [(equal? action 'toggle-git-ignored) (forest-toggle-git-ignored!) event-result/consume]
+    [(equal? action 'wider) (forest-wider!) event-result/consume]
+    [(equal? action 'narrower) (forest-narrower!) event-result/consume]
+    [(equal? action 'quit) (forest-close!) event-result/close]
+    [else event-result/consume]))
+
 (define (forest-handle-event-command state event)
   (define ch (key-event-char event))
   (cond
@@ -800,31 +855,15 @@
      (forest-switch-to-editor!)
      event-result/close] ; pops fg only; bg stays visible
 
-    [(and (char? ch) (equal? ch #\/))
-     (forest-enter-search!)
-     event-result/consume]
-
     [(key-event-backspace? event)
      (forest-clear-search!)
      event-result/consume]
 
-    [(and (char? ch) (equal? ch #\j)) (forest-cursor-down!) event-result/consume]
-    [(and (char? ch) (equal? ch #\k)) (forest-cursor-up!) event-result/consume]
+    [(and (char? ch) (equal? ch #\=)) (forest-wider!) event-result/consume] ; old alias not remappable
 
-    [(and (char? ch) (equal? ch #\q))
-     (forest-close!)
-     event-result/close] ; pops fg; forest-close! already popped bg
-
-    [(and (char? ch) (equal? ch #\n)) (forest-prompt-create!) event-result/consume]
-    [(and (char? ch) (equal? ch #\r)) (forest-prompt-rename!) event-result/consume]
-    [(and (char? ch) (equal? ch #\d)) (forest-prompt-delete!) event-result/consume]
-    [(and (char? ch) (equal? ch #\R)) (forest-refresh-all!) event-result/consume]
-
-    [(and (char? ch) (equal? ch #\g)) (forest-toggle-hidden!) event-result/consume]
-    [(and (char? ch) (equal? ch #\i)) (forest-toggle-git-ignored!) event-result/consume]
-
-    [(and (char? ch) (or (equal? ch #\+) (equal? ch #\=))) (forest-wider!) event-result/consume]
-    [(and (char? ch) (equal? ch #\-)) (forest-narrower!) event-result/consume]
+    [(char? ch)
+     (define action (forest-action-for-char ch))
+     (if action (forest-command-action! action) event-result/consume)]
 
     [else event-result/consume])) ; block unknown keys from editor while focused
 
@@ -1276,6 +1315,24 @@
 
       (loop (cdr lst) (+ x pw *forest-mini-gap*)))))
 
+(define (forest-mini-command-action! action)
+  (cond
+    [(equal? action 'down) (forest-mini-move! 1) event-result/consume]
+    [(equal? action 'up) (forest-mini-move! -1) event-result/consume]
+    [(equal? action 'enter) (forest-mini-enter!)]
+    [(equal? action 'back) (forest-mini-back!) event-result/consume]
+    [(equal? action 'quit) (forest-mini-close!) event-result/close]
+    [(equal? action 'create) (forest-mini-prompt-create!) event-result/consume]
+    [(equal? action 'rename) (forest-mini-prompt-rename!) event-result/consume]
+    [(equal? action 'delete) (forest-mini-prompt-delete!) event-result/consume]
+    [(equal? action 'refresh) (forest-mini-refresh-active!) event-result/consume]
+    [(equal? action 'search) (forest-mini-prompt-search!) event-result/consume]
+    [(equal? action 'toggle-hidden) (forest-toggle-hidden!) event-result/consume]
+    [(equal? action 'toggle-git-ignored) (forest-toggle-git-ignored!) event-result/consume]
+    [(equal? action 'wider) (forest-mini-wider!) event-result/consume]
+    [(equal? action 'narrower) (forest-mini-narrower!) event-result/consume]
+    [else event-result/consume]))
+
 (define (forest-mini-handle-event state event)
   (define ch (key-event-char event))
   (cond
@@ -1283,30 +1340,16 @@
     [*forest-modal-open?* event-result/ignore]
     [(key-event-down? event) (forest-mini-move! 1) event-result/consume]
     [(key-event-up? event) (forest-mini-move! -1) event-result/consume]
-    [(and (char? ch) (equal? ch #\j)) (forest-mini-move! 1) event-result/consume]
-    [(and (char? ch) (equal? ch #\k)) (forest-mini-move! -1) event-result/consume]
+    [(key-event-right? event) (forest-mini-enter!)]
+    [(key-event-enter? event) (forest-mini-enter!)]
+    [(key-event-left? event) (forest-mini-back!) event-result/consume]
+    [(key-event-escape? event) (forest-mini-close!) event-result/close]
 
-    [(or (key-event-right? event) (key-event-enter? event) (and (char? ch) (equal? ch #\l)))
-     (forest-mini-enter!)]
-    [(or (key-event-left? event) (and (char? ch) (equal? ch #\h)))
-     (forest-mini-back!)
-     event-result/consume]
+    [(and (char? ch) (equal? ch #\=)) (forest-mini-wider!) event-result/consume] ; legacy alias
 
-    [(or (key-event-escape? event) (and (char? ch) (equal? ch #\q)))
-     (forest-mini-close!)
-     event-result/close]
-
-    [(and (char? ch) (equal? ch #\n)) (forest-mini-prompt-create!) event-result/consume]
-    [(and (char? ch) (equal? ch #\r)) (forest-mini-prompt-rename!) event-result/consume]
-    [(and (char? ch) (equal? ch #\d)) (forest-mini-prompt-delete!) event-result/consume]
-    [(and (char? ch) (equal? ch #\R)) (forest-mini-refresh-active!) event-result/consume]
-    [(and (char? ch) (equal? ch #\/)) (forest-mini-prompt-search!) event-result/consume]
-
-    [(and (char? ch) (equal? ch #\g)) (forest-toggle-hidden!) event-result/consume]
-    [(and (char? ch) (equal? ch #\i)) (forest-toggle-git-ignored!) event-result/consume]
-
-    [(and (char? ch) (or (equal? ch #\+) (equal? ch #\=))) (forest-mini-wider!) event-result/consume]
-    [(and (char? ch) (equal? ch #\-)) (forest-mini-narrower!) event-result/consume]
+    [(char? ch)
+     (define action (forest-action-for-char ch))
+     (if action (forest-mini-command-action! action) event-result/consume)]
 
     [else event-result/consume]))
 
@@ -1328,3 +1371,11 @@
   (if (equal? *forest-style* 'mini)
       (forest-mini-open!)
       (forest-snacks-open!)))
+
+;;@doc
+;; Close the file tree
+(define (forest-close)
+  (when *forest-active*
+    (if (equal? *forest-style* 'mini)
+        (forest-mini-close!)
+        (forest-close!))))
