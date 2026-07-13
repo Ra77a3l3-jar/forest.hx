@@ -163,6 +163,23 @@
 (define (forest-set-style! style)
   (set! *forest-style* style))
 
+;; keep the panel off the rows moka's bars uses
+(define *forest-reserved-top-fn* 'unresolved)
+(define *forest-reserved-bottom-fn* 'unresolved)
+
+(define (forest-resolve-reserved!)
+  (when (equal? *forest-reserved-top-fn* 'unresolved)
+    (set! *forest-reserved-top-fn* (with-handler (lambda (_) #f) (eval 'moka-reserved-top)))
+    (set! *forest-reserved-bottom-fn* (with-handler (lambda (_) #f) (eval 'moka-reserved-bottom)))))
+
+(define (forest-reserved-top)
+  (forest-resolve-reserved!)
+  (if *forest-reserved-top-fn* (with-handler (lambda (_) 0) (*forest-reserved-top-fn*)) 0))
+
+(define (forest-reserved-bottom)
+  (forest-resolve-reserved!)
+  (if *forest-reserved-bottom-fn* (with-handler (lambda (_) 0) (*forest-reserved-bottom-fn*)) 0))
+
 (define (forest-take lst n)
   (if (or (null? lst) (<= n 0)) '() (cons (car lst) (forest-take (cdr lst) (- n 1)))))
 
@@ -668,7 +685,10 @@
   (define w (min *forest-width* (area-width rect)))
   (define h (area-height rect))
   (define x0 (forest-panel-x0 rect w))
-  (set! *forest-visible-height* (max 1 (- h *forest-search-height*)))
+  ;; panel spans only the rows not reserved by the bars
+  (define y0 (forest-reserved-top))
+  (define panel-h (max 1 (- h y0 (forest-reserved-bottom))))
+  (set! *forest-visible-height* (max 1 (- panel-h *forest-search-height*)))
   (if (equal? *forest-side* 'right)
       (set-editor-clip-right! w)
       (set-editor-clip-left! w))
@@ -681,41 +701,41 @@
   (define dim-style (style-with-dim (theme-scope-ref "ui.text")))
 
   ;; no border for cleaner look
-  (define panel-area (area x0 0 w h))
+  (define panel-area (area x0 y0 w panel-h))
   (buffer/clear-with frame panel-area bg-style)
 
   ;; border matches bg so it blends in instead of clashing across themes;
   (define border-style bg-style)
 
-  (define search-area (area x0 0 w *forest-search-height*))
+  (define search-area (area x0 y0 w *forest-search-height*))
   (block/render frame search-area (make-block bg-style border-style "all" "rounded"))
 
   (define title "Explorer")
   (when (> w (+ (string-length title) 4))
-    (frame-set-string! frame (+ x0 (quotient (- w (string-length title)) 2)) 0
+    (frame-set-string! frame (+ x0 (quotient (- w (string-length title)) 2)) y0
                         title (style-with-bold dir-style)))
 
   (define prompt (string-append *forest-query-prefix* *forest-query*))
   (define prompt-shown (forest-truncate prompt (- w 2)))
-  (frame-set-string! frame (+ x0 1) 1 prompt-shown text-style)
+  (frame-set-string! frame (+ x0 1) (+ y0 1) prompt-shown text-style)
 
   (when (forest-searching?)
     (define counter (string-append (number->string (length *forest-search-results*))
                                     "/" (number->string (length *forest-all-files*))))
     (define counter-x (- (+ x0 w) 1 (string-length counter)))
     (when (>= counter-x (+ x0 2 (string-length prompt-shown)))
-      (frame-set-string! frame counter-x 1 counter dim-style)))
+      (frame-set-string! frame counter-x (+ y0 1) counter dim-style)))
 
-  ;; full-height line marking the boundary with the text buffer
+  ;; line marking the boundary with the text buffer, spanning the panel row
   (when *forest-show-separator?*
     (define sep-x (if (equal? *forest-side* 'right) (- x0 1) w))
     (when (and (>= sep-x 0) (< sep-x (area-width rect)))
-      (let loop ([y 0])
-        (when (< y h)
+      (let loop ([y y0])
+        (when (< y (+ y0 panel-h))
           (frame-set-string! frame sep-x y "│" border-style)
           (loop (+ y 1))))))
 
-  (define list-y0 *forest-search-height*)
+  (define list-y0 (+ y0 *forest-search-height*))
   (define max-text-w (- w 1))
 
   (if (forest-searching?)
@@ -816,7 +836,8 @@
   (if *forest-typing?*
       (let* ([w (min *forest-width* (area-width area))]
              [x0 (forest-panel-x0 area w)])
-        (position 1 (+ x0 1 (string-length *forest-query-prefix*) (string-length *forest-query*))))
+        (position (+ (forest-reserved-top) 1)
+                  (+ x0 1 (string-length *forest-query-prefix*) (string-length *forest-query*))))
       #f))
 
 (define (forest-handle-event-typing state event)
