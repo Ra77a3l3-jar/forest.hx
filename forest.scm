@@ -4,6 +4,7 @@
 (require "helix/static.scm")
 (require "helix/ext.scm")
 (require (prefix-in helix. "helix/commands.scm"))
+(require (prefix-in helix.config. "helix/configuration.scm"))
 (require "notify/notify.scm")
 (require "glyph/glyph.scm")
 
@@ -405,6 +406,7 @@
      event-result/consume]))
 
 (define (forest-unfocus!)
+  (forest-reset-mouse!)
   (set! *forest-focused* #f))
 
 ;; leaves the tree focused but pops it off the stack, so the editor gets input again
@@ -416,6 +418,7 @@
   (forest-unfocus!))
 
 (define (forest-close!)
+  (forest-reset-mouse!)
   (set! *forest-active* #f)
   (set! *forest-focused* #f)
   (pop-last-component-by-name! "forest-fg")
@@ -476,6 +479,9 @@
 (define (forest-modal-handle-event state event)
   (define ch (key-event-char event))
   (cond
+    ;; the confirm branch below reads anything that isn't y as no, and a nudge of
+    ;; the mouse shouldn't cancel the prompt it is sitting in front of
+    [(mouse-event? event) event-result/consume]
     [(equal? *forest-modal-mode* 'confirm)
      (define cb *forest-modal-callback*)
      (set! *forest-modal-callback* #f)
@@ -681,6 +687,155 @@
                   (if dir? (forest-search-flatten val rel (+ depth 1)) '())
                   (loop (cdr items)))))))
 
+;; mouse kinds are bare integers; helix/components.scm documents the full table
+(define *forest-mouse-left-down* 0)
+(define *forest-mouse-left-up* 3)
+(define *forest-mouse-scroll-down* 10)
+(define *forest-mouse-scroll-up* 11)
+
+(define *forest-default-scroll-lines* 3) ; only used if editor.scroll-lines can't be read
+
+;; scroll-lines comes back as a float, and list-ref won't take one as an index
+(define (forest-scroll-amount)
+  (define raw (with-handler (lambda (_) #f)
+                            (helix.config.get-config-option-value "scroll-lines")))
+  (if (number? raw)
+      (max 1 (inexact->exact (floor (abs raw))))
+      *forest-default-scroll-lines*))
+
+(define (forest-mouse-kind? event kind)
+  (and (mouse-event? event) (equal? (event-mouse-kind event) kind)))
+
+(define (forest-mouse-left-down? event)
+  (forest-mouse-kind? event *forest-mouse-left-down*))
+
+(define (forest-mouse-left-up? event)
+  (forest-mouse-kind? event *forest-mouse-left-up*))
+
+;; acting on the press would let the drag and release through to the buffer, so
+;; clicks act on the release and have to land where the press did
+(define *forest-press* #f)
+
+(define (forest-press! target)
+  (set! *forest-press* target))
+
+(define (forest-take-press!)
+  (define pressed *forest-press*)
+  (set! *forest-press* #f)
+  pressed)
+
+;; 'up, 'down, or #f when this isn't a wheel event
+(define (forest-mouse-scroll-direction event)
+  (cond
+    [(forest-mouse-kind? event *forest-mouse-scroll-up*) 'up]
+    [(forest-mouse-kind? event *forest-mouse-scroll-down*) 'down]
+    [else #f]))
+
+;; components.scm has mouse-event-within-area?, but it excludes the top row of an
+;; area, which would make the first entry of every panel unclickable
+(define (forest-mouse-in-area? event a)
+  (and a
+       (mouse-event? event)
+       (let ([row (event-mouse-row event)]
+             [col (event-mouse-col event)])
+         (and (>= col (area-x a)) (< col (+ (area-x a) (area-width a)))
+              (>= row (area-y a)) (< row (+ (area-y a) (area-height a)))))))
+
+;; recorded while rendering: the geometry depends on state the handler can't see
+;; (reserved bars, the flattened search tree, column fitting)
+(define *forest-hit-panel* #f)   ; area of the whole sidebar
+(define *forest-hit-search* #f)  ; area of the search box above the entries
+(define *forest-hit-list* #f)    ; area of just its entry rows
+;; one slot per visible row: an index into *forest-tree* while browsing, a
+;; workspace-relative path while searching, or #f for an unselectable row
+(define *forest-hit-rows* '())
+(define *forest-hit-window* 0) ; first result row on screen, while searching
+
+(define (forest-hit-row-at event)
+  (and (forest-mouse-in-area? event *forest-hit-list*)
+       (let ([row (- (event-mouse-row event) (area-y *forest-hit-list*))])
+         (and (>= row 0)
+              (< row (length *forest-hit-rows*))
+              (list-ref *forest-hit-rows* row)))))
+
+;; resolves a recorded slot to a cursor position, or #f if it can't be selected
+(define (forest-hit-cursor-for slot)
+  (cond
+    [(int? slot) (and (< slot (length *forest-tree*)) slot)]
+    [(string? slot)
+     (let loop ([rs *forest-search-results*] [i 0])
+       (cond
+         [(null? rs) #f]
+         [(equal? (car rs) slot) i]
+         [else (loop (cdr rs) (+ i 1))]))]
+    [else #f]))
+
+;; what a press or release landed on, so the two can be compared
+(define (forest-click-target event)
+  (define slot (forest-hit-row-at event))
+  (cond
+    [slot (list 'row slot)]
+    [(forest-mouse-in-area? event *forest-hit-search*) 'search]
+    ;; the row padding and search headings are panel too, they just aren't rows
+    [(forest-mouse-in-area? event *forest-hit-panel*) 'panel]
+    [else 'buffer]))
+
+;; the row the last click landed on, so a second one activates it without a timer
+;; the cursor won't do: it can already be sitting on the row the first click hits
+(define *forest-click-slot* #f)
+
+;; results and mini columns centre on the selection as they render, sliding the
+;; clicked row out from under the pointer, so the window is held while it stays armed
+(define *forest-click-window* #f)      ; snacks search: first row of the window
+(define *forest-mini-click-window* #f) ; mini: (column window-start)
+
+(define (forest-forget-click!)
+  (set! *forest-click-slot* #f)
+  (set! *forest-click-window* #f)
+  (set! *forest-mini-click-window* #f))
+
+(define (forest-arm-click! slot)
+  (set! *forest-click-slot* slot))
+
+;; a keypress ends any gesture and stales whatever was armed
+(define (forest-reset-mouse!)
+  (forest-forget-click!)
+  (set! *forest-press* #f))
+
+;; a click in the tree leaves the query being typed, selectable row or not, but one
+;; in the search box is aiming at the query
+(define (forest-leave-typing-on-click! event)
+  (when (forest-mouse-in-area? event *forest-hit-list*)
+    (set! *forest-typing?* #f)))
+
+;; no-op if the slot fell out of the tree since it was recorded
+(define (forest-select-clicked! slot)
+  (define cursor (forest-hit-cursor-for slot))
+  (when cursor
+    (set! *forest-cursor* cursor)
+    (forest-arm-click! slot)
+    ;; browse mode scrolls independently of the cursor and needs no pinning
+    (when (forest-searching?) (set! *forest-click-window* *forest-hit-window*))))
+
+(define (forest-mouse-select! slot)
+  (cond
+    [(equal? slot *forest-click-slot*)
+     ;; toggling reshuffles the tree, so the armed row stops meaning the same entry
+     (forest-forget-click!)
+     (forest-activate!)]
+    [else
+     (forest-select-clicked! slot)
+     event-result/consume]))
+
+;; cursor-up!/down! handle the window, so a notch is just repeated steps
+;; a short list doesn't shift under the pointer, so the arm goes with it
+(define (forest-scroll-by! direction amount)
+  (forest-forget-click!)
+  (let loop ([n amount])
+    (when (> n 0)
+      (if (equal? direction 'up) (forest-cursor-up!) (forest-cursor-down!))
+      (loop (- n 1)))))
+
 (define (forest-render-bg state rect frame)
   (define w (min *forest-width* (area-width rect)))
   (define h (area-height rect))
@@ -738,6 +893,11 @@
   (define list-y0 (+ y0 *forest-search-height*))
   (define max-text-w (- w 1))
 
+  (set! *forest-hit-panel* panel-area)
+  (set! *forest-hit-search* search-area)
+  (set! *forest-hit-list* (area x0 list-y0 w *forest-visible-height*))
+  (set! *forest-hit-rows* '())
+
   (if (forest-searching?)
       (if (null? *forest-search-results*)
           (frame-set-string! frame (+ x0 1) list-y0 "(no matches)" dim-style)
@@ -750,8 +910,13 @@
                                        [else (loop (cdr rs) (+ i 1))]))]
                  [total-rows (length rows)]
                  [window-start (max 0 (min (max 0 (- total-rows *forest-visible-height*))
-                                            (max 0 (- selected-row (forest-half-floor *forest-visible-height*)))))]
+                                            (or *forest-click-window*
+                                                (max 0 (- selected-row (forest-half-floor *forest-visible-height*))))))]
                  [visible (forest-take (forest-drop rows window-start) *forest-visible-height*)])
+            ;; headings aren't selectable, so they record #f and a click does nothing
+            (set! *forest-hit-window* window-start)
+            (set! *forest-hit-rows*
+                  (map (lambda (e) (if (list-ref e 1) #f (list-ref e 3))) visible))
             (let loop ([items visible] [row 0])
               (unless (or (null? items) (>= row *forest-visible-height*))
                 (define entry (car items))
@@ -788,6 +953,9 @@
                 (loop (cdr items) (+ row 1))))))
       (let ([visible (forest-take (forest-drop *forest-tree* *forest-window-start*)
                                    *forest-visible-height*)])
+        (set! *forest-hit-rows*
+              (let loop ([items visible] [i *forest-window-start*])
+                (if (null? items) '() (cons i (loop (cdr items) (+ i 1))))))
         (let loop ([items visible] [row 0])
           (unless (or (null? items) (>= row *forest-visible-height*))
             (define entry (car items))
@@ -823,9 +991,44 @@
             (frame-set-string! frame name-x y (forest-truncate name avail) row-style)
             (loop (cdr items) (+ row 1)))))))
 
+;; forest-snacks-open! would reveal the current file and move off the clicked row
+;; deferred since the compositor can't be restacked mid-dispatch
+(define (forest-refocus-from-click!)
+  (unless *forest-focused*
+    (set! *forest-focused* #t)
+    (enqueue-thread-local-callback
+     ;; a second fg would never be popped
+     (lambda () (when *forest-focused* (push-component! (forest-make-fg-component)))))))
+
 (define (forest-handle-event-bg state event)
-  ;; makes the editor receive events while the panel is unfocused
-  event-result/ignore)
+  ;; unfocused, so anything the mouse doesn't claim falls through to the editor
+  (define dir (forest-mouse-scroll-direction event))
+  (cond
+    ;; a key ends any gesture, so a lost release can't leave the panel eating clicks
+    [(not (mouse-event? event))
+     (forest-reset-mouse!)
+     event-result/ignore]
+    ;; tested before the panel rect, since the gesture may have wandered off it
+    [*forest-press*
+     (when (forest-mouse-left-up? event)
+       ;; select rather than activate, but arm the row so the next click opens it
+       (define target (forest-click-target event))
+       (when (equal? target (forest-take-press!))
+         (forest-leave-typing-on-click! event)
+         (when (pair? target) (forest-select-clicked! (cadr target)))
+         (when (equal? target 'search) (set! *forest-typing?* #t))
+         (forest-refocus-from-click!)))
+     event-result/consume]
+    [(not (forest-mouse-in-area? event *forest-hit-panel*)) event-result/ignore]
+    [(forest-mouse-left-down? event)
+     (forest-press! (forest-click-target event))
+     event-result/consume]
+    [dir
+     ;; scrolling over the panel reads as inspecting it, not entering it
+     (forest-scroll-by! dir (forest-scroll-amount))
+     (helix.redraw '()) ; unfocused, so consuming alone won't re-render
+     event-result/consume]
+    [else event-result/ignore]))
 
 (struct ForestFgState ())
 
@@ -904,11 +1107,51 @@
 
     [else event-result/consume])) ; block unknown keys from editor while focused
 
+(define (forest-handle-mouse-fg state event)
+  (define dir (forest-mouse-scroll-direction event))
+  (cond
+    [(forest-mouse-left-down? event)
+     (forest-press! (forest-click-target event))
+     event-result/consume]
+    [(forest-mouse-left-up? event)
+     (define target (forest-click-target event))
+     (cond
+       [(not (equal? target (forest-take-press!))) event-result/consume]
+       [(pair? target)
+        (forest-leave-typing-on-click! event)
+        (forest-mouse-select! (cadr target))]
+       ;; picks up wherever the query left off rather than starting a new one
+       [(equal? target 'search)
+        (set! *forest-typing?* #t)
+        event-result/consume]
+       [(equal? target 'panel)
+        (forest-leave-typing-on-click! event)
+        event-result/consume]
+       ;; helix has already spent this event, so it takes another to place the caret
+       [else
+        (forest-switch-to-editor!)
+        event-result/close])]
+    [dir
+     (if (forest-mouse-in-area? event *forest-hit-panel*)
+         (begin
+           (forest-scroll-by! dir (forest-scroll-amount))
+           event-result/consume)
+         ;; let the buffer scroll under the pointer without losing the panel
+         event-result/ignore)]
+    ;; drags and bare movement would otherwise fall through to the editor
+    [else event-result/consume]))
+
 (define (forest-handle-event-fg state event)
   (cond
     [*forest-modal-open?* event-result/ignore]
-    [*forest-typing?* (forest-handle-event-typing state event)]
-    [else (forest-handle-event-command state event)]))
+    ;; ahead of the typing branch so the tree stays clickable mid-query
+    [(mouse-event? event) (forest-handle-mouse-fg state event)]
+    [else
+     ;; any keypress can move the cursor, so an armed row stops meaning anything
+     (forest-reset-mouse!)
+     (if *forest-typing?*
+         (forest-handle-event-typing state event)
+         (forest-handle-event-command state event))]))
 
 (define (forest-make-bg-component)
   (new-component! "forest-bg"
@@ -992,6 +1235,7 @@
     (forest-mini-set-cursor! col (max 0 (min (- n 1) (+ (forest-mini-cursor col) delta))))))
 
 (define (forest-mini-close!)
+  (forest-reset-mouse!)
   (set! *forest-active* #f)
   (pop-last-component-by-name! "forest-mini"))
 
@@ -1107,10 +1351,19 @@
 (define (forest-mini-narrower!)
   (set! *forest-mini-width-boost* (max (- *forest-mini-min-w*) (- *forest-mini-width-boost* 4))))
 
+(define (forest-mini-clamp-window start count height)
+  (max 0 (min (max 0 (- count height)) start)))
+
 ;; centers the cursor within a column's visible window
 (define (forest-mini-window-start cursor count height)
-  (define max-start (max 0 (- count height)))
-  (max 0 (min max-start (- cursor (quotient height 2)))))
+  (forest-mini-clamp-window (- cursor (quotient height 2)) count height))
+
+;; a clicked column keeps the window it was clicked against
+(define (forest-mini-pinned-window col cursor count height)
+  (if (and *forest-mini-click-window*
+           (equal? col (car *forest-mini-click-window*)))
+      (forest-mini-clamp-window (cadr *forest-mini-click-window*) count height)
+      (forest-mini-window-start cursor count height)))
 
 (define *forest-mini-preview-max-lines* 200)
 (define *forest-mini-preview-min-w* 15)
@@ -1262,6 +1515,122 @@
       (frame-set-string! frame x (+ y0 row) (forest-truncate (car items) w) style)
       (iloop (cdr items) (+ row 1)))))
 
+;; recorded while rendering: which ancestors survived fit isn't visible to the handler
+(define *forest-mini-hit-panels* '()) ; one area per panel drawn, borders included
+(define *forest-mini-hit-cols* '())   ; (area column window-start) per column
+(define *forest-mini-hit-preview* #f) ; (area entry-count) when the preview lists a directory
+
+;; one box over all of them would swallow clicks beside a short column
+(define (forest-mini-inside-panel? event)
+  (let loop ([ps *forest-mini-hit-panels*])
+    (cond
+      [(null? ps) #f]
+      [(forest-mouse-in-area? event (car ps)) #t]
+      [else (loop (cdr ps))])))
+
+;; (column entry-index window-start), or #f when no column is under the pointer
+(define (forest-mini-hit event)
+  (let loop ([cs *forest-mini-hit-cols*])
+    (cond
+      [(null? cs) #f]
+      [else
+       (define rect (list-ref (car cs) 0))
+       (define col (list-ref (car cs) 1))
+       (define ws (list-ref (car cs) 2))
+       (if (forest-mouse-in-area? event rect)
+           (list col (+ ws (- (event-mouse-row event) (area-y rect))) ws)
+           (loop (cdr cs)))])))
+
+(define (forest-mini-in-preview? event)
+  (and *forest-mini-hit-preview*
+       (forest-mouse-in-area? event (car *forest-mini-hit-preview*))))
+
+;; as above, but a column hit carries the entry, since a panel holds many
+(define (forest-mini-click-target event hit)
+  (cond
+    [hit (list 'entry (list-ref hit 0) (list-ref hit 1))]
+    [(forest-mini-in-preview? event) 'preview]
+    [(forest-mini-inside-panel? event) 'panel]
+    [else 'buffer]))
+
+(define (forest-mini-click! hit)
+  (define col (list-ref hit 0))
+  (define entry-idx (list-ref hit 1))
+  (define ws (list-ref hit 2))
+  (define entries (ForestMiniColumn-entries col))
+  (cond
+    [(or (null? entries) (>= entry-idx (length entries))) event-result/consume]
+    [else
+     (define idx (forest-mini-index-of *forest-mini-stack* col))
+     (define active? (equal? col (forest-mini-active-column)))
+     (define slot (list idx entry-idx))
+     (cond
+       ;; second click on the same entry cascades into it or opens it
+       [(and active? (equal? slot *forest-click-slot*))
+        ;; cascading rebuilds the stack, so the armed slot stops meaning anything
+        (forest-forget-click!)
+        (forest-mini-enter!)]
+       [else
+        ;; clicking an ancestor drops the cascade off it, as h repeatedly would
+        (when (and idx (not active?))
+          (set! *forest-mini-stack* (forest-take *forest-mini-stack* (+ idx 1))))
+        (forest-mini-set-cursor! col entry-idx)
+        (forest-arm-click! slot)
+        (set! *forest-mini-click-window* (list col ws))
+        event-result/consume])]))
+
+;; the preview looks just like the column cascading would open, so a click descends
+;; and lands on the entry clicked
+(define (forest-mini-preview-click! event)
+  (define row (- (event-mouse-row event) (area-y (car *forest-mini-hit-preview*))))
+  (define entry (forest-mini-current-entry))
+  (cond
+    ;; a short directory is padded to the minimum height; that padding is inert
+    [(or (< row 0) (>= row (cadr *forest-mini-hit-preview*))) event-result/consume]
+    [(not (and entry (is-dir? (car entry)))) event-result/consume]
+    [else
+     (define result (forest-mini-enter!))
+     (define col (forest-mini-active-column))
+     ;; the directory can have shrunk since it was drawn
+     (when (< row (length (ForestMiniColumn-entries col)))
+       (forest-mini-set-cursor! col row)
+       (forest-arm-click! (list (forest-mini-index-of *forest-mini-stack* col) row))
+       ;; the preview is drawn from the top, so the cascaded column has to be too
+       (set! *forest-mini-click-window* (list col 0)))
+     result]))
+
+(define (forest-mini-handle-mouse state event)
+  (define dir (forest-mouse-scroll-direction event))
+  (define hit (forest-mini-hit event))
+  (cond
+    [(forest-mouse-left-down? event)
+     (forest-press! (forest-mini-click-target event hit))
+     event-result/consume]
+    [(forest-mouse-left-up? event)
+     (define target (forest-mini-click-target event hit))
+     (cond
+       [(not (equal? target (forest-take-press!))) event-result/consume]
+       [hit (forest-mini-click! hit)]
+       [(equal? target 'preview) (forest-mini-preview-click! event)]
+       [(equal? target 'panel) event-result/consume]
+       ;; the columns float over the buffer, so clicking off them matches escape
+       [else
+        (forest-mini-close!)
+        event-result/close])]
+    ;; a column's window follows its cursor, so scrolling an ancestor could only
+    ;; move the screen by moving its selection, dropping the cascade off it
+    [(and dir (or (not hit) (equal? (list-ref hit 0) (forest-mini-active-column))))
+     (if (forest-mini-inside-panel? event)
+         ;; a short column doesn't scroll under the pointer, so the arm goes with it
+         (begin
+           (forest-forget-click!)
+           (forest-mini-move! (if (equal? dir 'up)
+                                  (- (forest-scroll-amount))
+                                  (forest-scroll-amount)))
+           event-result/consume)
+         event-result/ignore)]
+    [else event-result/consume]))
+
 (define (forest-mini-render state rect frame)
   (define sw (area-width rect))
   (define sh (area-height rect))
@@ -1318,6 +1687,10 @@
                  *forest-mini-margin*))
   (define y0 *forest-mini-margin*)
 
+  (set! *forest-mini-hit-cols* '())
+  (set! *forest-mini-hit-panels* '())
+  (set! *forest-mini-hit-preview* #f)
+
   (let loop ([lst visible] [x x0])
     (unless (null? lst)
       (define spec (car lst))
@@ -1332,6 +1705,7 @@
 
       (buffer/clear-with frame panel-area bg-style)
       (block/render frame panel-area (make-block bg-style border-style "all" "rounded"))
+      (set! *forest-mini-hit-panels* (cons panel-area *forest-mini-hit-panels*))
 
       (cond
         [(equal? kind 'col)
@@ -1339,10 +1713,12 @@
          (define entries (ForestMiniColumn-entries col))
          (define cursor (forest-mini-cursor col))
          (define active? (equal? col active-col))
-         (define ws (forest-mini-window-start cursor (length entries) h))
+         (define ws (forest-mini-pinned-window col cursor (length entries) h))
+         (set! *forest-mini-hit-cols* (cons (list (area cx cy w h) col ws) *forest-mini-hit-cols*))
          (forest-mini-render-entries frame cx cy w h entries ws cursor active?
                                 text-style hl-style dir-style dim-style)]
         [(equal? kind 'preview-dir)
+         (set! *forest-mini-hit-preview* (list (area cx cy w h) (length (list-ref spec 1))))
          (forest-mini-render-entries frame cx cy w h (list-ref spec 1) 0 -1 #f
                                 text-style hl-style dir-style dim-style)]
         [(equal? kind 'preview-file)
@@ -1370,11 +1746,9 @@
     [(equal? action 'narrower) (forest-mini-narrower!) event-result/consume]
     [else event-result/consume]))
 
-(define (forest-mini-handle-event state event)
+(define (forest-mini-handle-keys state event)
   (define ch (key-event-char event))
   (cond
-    ;; do not register keys when doing new/rename
-    [*forest-modal-open?* event-result/ignore]
     [(key-event-down? event) (forest-mini-move! 1) event-result/consume]
     [(key-event-up? event) (forest-mini-move! -1) event-result/consume]
     [(key-event-right? event) (forest-mini-enter!)]
@@ -1389,6 +1763,16 @@
      (if action (forest-mini-command-action! action) event-result/consume)]
 
     [else event-result/consume]))
+
+(define (forest-mini-handle-event state event)
+  (cond
+    ;; do not register keys when doing new/rename
+    [*forest-modal-open?* event-result/ignore]
+    [(mouse-event? event) (forest-mini-handle-mouse state event)]
+    [else
+     ;; any keypress can move the cursor, so an armed entry stops meaning anything
+     (forest-reset-mouse!)
+     (forest-mini-handle-keys state event)]))
 
 (define (forest-mini-make-component)
   (new-component! "forest-mini" (ForestMiniState) forest-mini-render (hash "handle_event" forest-mini-handle-event)))

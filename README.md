@@ -70,6 +70,14 @@ Bind `:forest-open` to a key, e.g. in `init.scm`:
 
 Opening or refocusing the tree reveals and centers whatever file is currently open in the editor.
 
+| Mouse | Action |
+|-------|--------|
+| Click an entry | Select it, focusing the panel first if the editor had focus |
+| Click it again | Open the file, or toggle the directory |
+| Click the search box | Start typing, keeping whatever query is already there |
+| Wheel over the panel | Scroll the selection by `editor.scroll-lines` |
+| Click in the buffer | Return focus to the editor, panel stays open |
+
 ### `mini` style
 
 | Key | Action |
@@ -89,7 +97,17 @@ Opening or refocusing the tree reveals and centers whatever file is currently op
 
 Opening the tree reveals whatever file is currently open in the editor, cascading a column for each ancestor directory along the way.
 
+| Mouse | Action |
+|-------|--------|
+| Click an entry | Select it; in an ancestor column, drop the columns cascaded off it |
+| Click it again | Open the file, or cascade into the directory |
+| Click in the preview | Cascade into the previewed directory, landing on the entry clicked |
+| Wheel over the active column or preview | Move the selection by `editor.scroll-lines` |
+| Click off the columns | Close |
+
 ## Notes
 
+- Mouse support needs Helix's own `editor.mouse` left on (it is by default).
+- Two clicks on an entry activate it. They needn't be quick, but a keypress in between cancels.
 - Requires [notify.hx](https://github.com/chuwy/notify.hx) (pulled in automatically as a dependency) for create/rename/delete notifications.
 - Uses [glyph.hx](https://github.com/Ra77a3l3-jar/glyph.hx) for all the diffrent icons.
