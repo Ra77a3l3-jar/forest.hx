@@ -827,6 +827,15 @@
       (if (equal? direction 'up) (forest-cursor-up!) (forest-cursor-down!))
       (loop (- n 1)))))
 
+(define *forest-scroll-pending* #f)
+
+(define (forest-debounce-scroll! action-thunk)
+  (unless *forest-scroll-pending*
+    (set! *forest-scroll-pending* #t) ;; close event gate
+    (action-thunk) ;; apply scroll
+    (enqueue-thread-local-callback
+     (lambda () (set! *forest-scroll-pending* #f))))) ;; reopen gate
+
 (define (forest-render-bg state rect frame)
   (define w (min *forest-width* (area-width rect)))
   (define h (area-height rect))
@@ -1016,7 +1025,7 @@
      event-result/consume]
     [dir
      ;; scrolling over the panel reads as inspecting it, not entering it
-     (forest-scroll-by! dir *forest-scroll-amount*)
+     (forest-debounce-scroll! (lambda () (forest-scroll-by! dir *forest-scroll-amount*)))
      (helix.redraw '()) ; unfocused, so consuming alone won't re-render
      event-result/consume]
     [else event-result/ignore]))
@@ -1125,7 +1134,7 @@
     [dir
      (if (forest-mouse-in-area? event *forest-hit-panel*)
          (begin
-           (forest-scroll-by! dir *forest-scroll-amount*)
+           (forest-debounce-scroll! (lambda () (forest-scroll-by! dir *forest-scroll-amount*)))
            event-result/consume)
          ;; let the buffer scroll under the pointer without losing the panel
          event-result/ignore)]
@@ -1615,9 +1624,11 @@
          ;; a short column doesn't scroll under the pointer, so the arm goes with it
          (begin
            (forest-forget-click!)
-           (forest-mini-move! (if (equal? dir 'up)
-                                  (- *forest-scroll-amount*)
-                                  *forest-scroll-amount*))
+           (forest-debounce-scroll!
+            (lambda ()
+              (forest-mini-move! (if (equal? dir 'up)
+                                     (- *forest-scroll-amount*)
+                                     *forest-scroll-amount*))))
            event-result/consume)
          event-result/ignore)]
     [else event-result/consume]))
