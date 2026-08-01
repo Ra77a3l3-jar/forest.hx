@@ -75,7 +75,7 @@ Opening or refocusing the tree reveals and centers whatever file is currently op
 | Click an entry | Select it, focusing the panel first if the editor had focus |
 | Click it again | Open the file, or toggle the directory |
 | Click the search box | Start typing, keeping whatever query is already there |
-| Wheel over the panel | Scroll the selection by `editor.scroll-lines` |
+| Wheel over the panel | Scroll the selection |
 | Click in the buffer | Return focus to the editor, panel stays open |
 
 ### `mini` style
@@ -102,7 +102,7 @@ Opening the tree reveals whatever file is currently open in the editor, cascadin
 | Click an entry | Select it; in an ancestor column, drop the columns cascaded off it |
 | Click it again | Open the file, or cascade into the directory |
 | Click in the preview | Cascade into the previewed directory, landing on the entry clicked |
-| Wheel over the active column or preview | Move the selection by `editor.scroll-lines` |
+| Wheel over the active column or preview | Move the selection |
 | Click off the columns | Close |
 
 ## Notes

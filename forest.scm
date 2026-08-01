@@ -4,7 +4,6 @@
 (require "helix/static.scm")
 (require "helix/ext.scm")
 (require (prefix-in helix. "helix/commands.scm"))
-(require (prefix-in helix.config. "helix/configuration.scm"))
 (require "notify/notify.scm")
 (require "glyph/glyph.scm")
 
@@ -693,15 +692,7 @@
 (define *forest-mouse-scroll-down* 10)
 (define *forest-mouse-scroll-up* 11)
 
-(define *forest-default-scroll-lines* 3) ; only used if editor.scroll-lines can't be read
-
-;; scroll-lines comes back as a float, and list-ref won't take one as an index
-(define (forest-scroll-amount)
-  (define raw (with-handler (lambda (_) #f)
-                            (helix.config.get-config-option-value "scroll-lines")))
-  (if (number? raw)
-      (max 1 (inexact->exact (floor (abs raw))))
-      *forest-default-scroll-lines*))
+(define *forest-scroll-amount* 1) ; entries per wheel notch
 
 (define (forest-mouse-kind? event kind)
   (and (mouse-event? event) (equal? (event-mouse-kind event) kind)))
@@ -1025,7 +1016,7 @@
      event-result/consume]
     [dir
      ;; scrolling over the panel reads as inspecting it, not entering it
-     (forest-scroll-by! dir (forest-scroll-amount))
+     (forest-scroll-by! dir *forest-scroll-amount*)
      (helix.redraw '()) ; unfocused, so consuming alone won't re-render
      event-result/consume]
     [else event-result/ignore]))
@@ -1134,7 +1125,7 @@
     [dir
      (if (forest-mouse-in-area? event *forest-hit-panel*)
          (begin
-           (forest-scroll-by! dir (forest-scroll-amount))
+           (forest-scroll-by! dir *forest-scroll-amount*)
            event-result/consume)
          ;; let the buffer scroll under the pointer without losing the panel
          event-result/ignore)]
@@ -1625,8 +1616,8 @@
          (begin
            (forest-forget-click!)
            (forest-mini-move! (if (equal? dir 'up)
-                                  (- (forest-scroll-amount))
-                                  (forest-scroll-amount)))
+                                  (- *forest-scroll-amount*)
+                                  *forest-scroll-amount*))
            event-result/consume)
          event-result/ignore)]
     [else event-result/consume]))
