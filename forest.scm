@@ -1242,9 +1242,11 @@
 (define (forest-cursor-fn-fg state area)
   (if *forest-typing?*
       (let* ([w (min *forest-width* (area-width area))]
-             [x0 (forest-panel-x0 area w)])
+             [x0 (forest-panel-x0 area w)]
+             [box-x (if (and *forest-show-separator?* (not (equal? *forest-side* 'right)))
+                        (+ x0 1) x0)])
         (position (+ (forest-reserved-top) 1)
-                  (+ x0 1 (string-length *forest-query-prefix*) (string-length *forest-query*))))
+                  (+ box-x 1 (string-length *forest-query-prefix*) (string-length *forest-query*))))
       #f))
 
 (define (forest-handle-event-typing state event)
