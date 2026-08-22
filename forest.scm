@@ -145,6 +145,24 @@
 (provide forest-set-keybinds!)
 (provide forest-set-sidebar-bg!)
 (provide forest-set-search-color!)
+(provide forest-snacks-active?)
+(provide forest-snacks-side)
+(provide forest-snacks-width)
+
+;;@doc
+;; true while the snacks sidebar is open, so plugins wont go over sidebar
+(define (forest-snacks-active?)
+  (and *forest-active* (equal? *forest-style* 'snacks)))
+
+;;@doc
+;; Side the snacks sidebar sits on: 'left or 'right
+(define (forest-snacks-side)
+  *forest-side*)
+
+;;@doc
+;; Width in columns of the snacks sidebar, 0 while it is closed
+(define (forest-snacks-width)
+  (if (and *forest-active* (equal? *forest-style* 'snacks)) *forest-width* 0))
 
 ;;@doc
 ;; Override any subset of forest's keybindings from init.scm
