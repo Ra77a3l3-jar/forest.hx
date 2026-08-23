@@ -113,8 +113,8 @@
 (define *forest-default-keybinds*
   (hash 'down "j"
         'up "k"
-        'enter "l" ; in mini, in addition to the right arrow/Enter
-        'back "h" ; in mini, addition to the left arrow
+        'enter "l" ; snacks: enter dir or open file; mini: cascade
+        'back "h" ; snacks: leave folder; mini: parent column
         'search "/"
         'create "n"
         'rename "r"
@@ -288,9 +288,10 @@
 ;; snaks keybinds
 (define (forest-snacks-help-rows)
   (list
-   (list (string-append (forest-help-key 'down) " / " (forest-help-key 'up) " / ↑ / ↓") "Navigate")
-   (list "Enter" "Open file or toggle dir")
-   (list "Tab" "Toggle directory")
+    (list (string-append (forest-help-key 'down) " / " (forest-help-key 'up) " / ↑ / ↓") "Navigate in folder")
+    (list (string-append (forest-help-key 'enter) " / →") "Enter dir or open file")
+    (list (string-append (forest-help-key 'back) " / ←") "Leave folder")
+    (list "Enter / Tab" "Toggle directory")
    (list (forest-help-key 'search) "Fuzzy search")
    (list (forest-help-key 'create) "Create file or dir")
    (list (forest-help-key 'rename) "Rename entry")
@@ -508,18 +509,62 @@
 (define (forest-active-count)
   (if (forest-searching?) (length *forest-search-results*) (length *forest-tree*)))
 
+(define (forest-index-of lst x)
+  (let loop ([xs lst] [i 0])
+    (cond
+      [(null? xs) #f]
+      [(equal? (car xs) x) i]
+      [else (loop (cdr xs) (+ i 1))])))
+
+(define (forest-wrap i n)
+  (cond
+    [(< i 0) (- n 1)]
+    [(>= i n) 0]
+    [else i]))
+
+(define (forest-ensure-cursor-visible!)
+  (define last-vis (+ *forest-window-start* (- *forest-visible-height* 1)))
+  (when (> *forest-cursor* last-vis)
+    (set! *forest-window-start* (- *forest-cursor* (- *forest-visible-height* 1))))
+  (when (< *forest-cursor* *forest-window-start*)
+    (set! *forest-window-start* *forest-cursor*)))
+
+;; indices of entries that share the current entry's parent
+(define (forest-sibling-indices)
+  (define entry (forest-current-entry))
+  (if (not entry)
+      '()
+      (let ([parent (forest-parent-path (car entry))])
+        (let loop ([items *forest-tree*] [i 0] [acc '()])
+          (cond
+            [(null? items) (reverse acc)]
+            [(equal? (forest-parent-path (car (car items))) parent)
+             (loop (cdr items) (+ i 1) (cons i acc))]
+            [else (loop (cdr items) (+ i 1) acc)])))))
+
+(define (forest-cursor-sibling! delta)
+  (define idxs (forest-sibling-indices))
+  (define n (length idxs))
+  (define pos (forest-index-of idxs *forest-cursor*))
+  (when (and (> n 0) pos)
+    (set! *forest-cursor* (list-ref idxs (forest-wrap (+ pos delta) n)))
+    (forest-ensure-cursor-visible!)))
+
 (define (forest-cursor-down!)
-  (define n (forest-active-count))
-  (when (< *forest-cursor* (- n 1))
-    (set! *forest-cursor* (+ *forest-cursor* 1))
-    (when (> *forest-cursor* (+ *forest-window-start* (- *forest-visible-height* 1)))
-      (set! *forest-window-start* (+ *forest-window-start* 1)))))
+  (if (forest-searching?)
+      (let ([n (forest-active-count)])
+        (when (> n 0)
+          (set! *forest-cursor* (forest-wrap (+ *forest-cursor* 1) n))
+          (forest-ensure-cursor-visible!)))
+      (forest-cursor-sibling! 1)))
 
 (define (forest-cursor-up!)
-  (when (> *forest-cursor* 0)
-    (set! *forest-cursor* (- *forest-cursor* 1))
-    (when (< *forest-cursor* *forest-window-start*)
-      (set! *forest-window-start* (- *forest-window-start* 1)))))
+  (if (forest-searching?)
+      (let ([n (forest-active-count)])
+        (when (> n 0)
+          (set! *forest-cursor* (forest-wrap (- *forest-cursor* 1) n))
+          (forest-ensure-cursor-visible!)))
+      (forest-cursor-sibling! -1)))
 
 (define (forest-current-entry)
   (if (forest-searching?)
@@ -607,6 +652,57 @@
     [(is-dir? (car entry))
      (forest-toggle-dir! (car entry))
      event-result/consume]))
+
+(define (forest-dir-expanded? path)
+  (and (is-dir? path)
+       (hash-contains? *forest-directories* path)
+       (not (hash-try-get *forest-directories* path))))
+
+(define (forest-path-in-workspace? path)
+  (define ws (helix-find-workspace))
+  (or (equal? path ws)
+      (starts-with? path (string-append ws (path-separator)))))
+
+(define (forest-first-child-index path)
+  (let loop ([items *forest-tree*] [i 0])
+    (cond
+      [(null? items) #f]
+      [(equal? (forest-parent-path (car (car items))) path) i]
+      [else (loop (cdr items) (+ i 1))])))
+
+;; expand if needed and move onto the first child
+(define (forest-enter-dir! path)
+  (unless (forest-dir-expanded? path)
+    (forest-toggle-dir! path))
+  (define idx (forest-first-child-index path))
+  (when idx
+    (set! *forest-cursor* idx)
+    (forest-ensure-cursor-visible!)))
+
+(define (forest-enter-or-open!)
+  (define entry (forest-current-entry))
+  (cond
+    [(not entry) event-result/consume]
+    [(is-file? (car entry)) (forest-activate!)]
+    [(is-dir? (car entry))
+     (forest-enter-dir! (car entry))
+     event-result/consume]
+    [else event-result/consume]))
+
+;; leave the current folder collapses it and moves to parent
+(define (forest-goto-parent!)
+  (define entry (forest-current-entry))
+  (when (and entry (not (forest-searching?)))
+    (define path (car entry))
+    (define ws (helix-find-workspace))
+    (cond
+      [(equal? path ws) void]
+      [else
+       (define parent (forest-parent-path path))
+       (when (and (string? parent) (forest-path-in-workspace? parent))
+         (when (and (forest-dir-expanded? parent) (not (equal? parent ws)))
+           (forest-toggle-dir! parent))
+         (forest-seek-file! parent))])))
 
 (define (forest-unfocus!)
   (forest-reset-mouse!)
@@ -1310,6 +1406,8 @@
   (cond
     [(equal? action 'down) (forest-cursor-down!) event-result/consume]
     [(equal? action 'up) (forest-cursor-up!) event-result/consume]
+    [(equal? action 'enter) (forest-enter-or-open!)]
+    [(equal? action 'back) (forest-goto-parent!) event-result/consume]
     [(equal? action 'search) (forest-enter-search!) event-result/consume]
     [(equal? action 'create) (forest-prompt-create!) event-result/consume]
     [(equal? action 'rename) (forest-prompt-rename!) event-result/consume]
@@ -1328,6 +1426,8 @@
   (cond
     [(key-event-down? event) (forest-cursor-down!) event-result/consume]
     [(key-event-up? event) (forest-cursor-up!) event-result/consume]
+    [(key-event-right? event) (forest-enter-or-open!)]
+    [(key-event-left? event) (forest-goto-parent!) event-result/consume]
     [(key-event-enter? event) (forest-activate!)]
     [(key-event-tab? event)
      (define entry (forest-current-entry))

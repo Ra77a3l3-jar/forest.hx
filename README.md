@@ -64,9 +64,10 @@ Bind `:forest-open` to a key, e.g. in `init.scm`:
 
 | Key | Action |
 |-----|--------|
-| `↑` / `↓` / `j` / `k` | Navigate |
-| `Enter` | Open the selected file, or toggle the selected directory |
-| `Tab` | Toggle the selected directory (outside search) |
+| `↑` / `↓` / `j` / `k` | Navigate within the current folder, wrapping at the ends |
+| `→` / `l` | Enter the selected directory, or open the selected file |
+| `←` / `h` | Leave the current folder and collapse it |
+| `Enter` / `Tab` | Toggle the selected directory (outside search) |
 | `/` | Start typing a fuzzy search query |
 | `n` | Create a file or directory (end name with `/` for a directory) |
 | `r` | Rename the selected entry |
