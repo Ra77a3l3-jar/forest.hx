@@ -107,6 +107,7 @@
 (define *forest-directories* (hash))
 (define *forest-query* "")
 (define *forest-all-files* '())
+(define *forest-files-scanned?* #f)
 (define *forest-search-results* '())
 (define *forest-typing?* #f)
 
@@ -416,11 +417,20 @@
 
 (define (forest-searching?) (not (equal? *forest-query* "")))
 
-;; dirs before files, alphabetic oder
+;; shared by the tree walk and the search walk so ignored dirs are not entered
+(define (forest-skip-entry? path)
+  (define name (file-name path))
+  (or (hashset-contains? *forest-ignore-set* name)
+      (and (not *forest-show-hidden*) (forest-dotfile? name))
+      (and (not *forest-show-git-ignored*) (forest-git-ignored? path))))
+
+;; dirs before files, alphabetic oder, one is-dir? per path
 (define (forest-sort-entries lst)
-  (define dirs (sort (filter is-dir? lst) string<?))
-  (define files (sort (filter (lambda (p) (not (is-dir? p))) lst) string<?))
-  (append dirs files))
+  (let loop ([xs lst] [dirs '()] [files '()])
+    (cond
+      [(null? xs) (append (sort dirs string<?) (sort files string<?))]
+      [(is-dir? (car xs)) (loop (cdr xs) (cons (car xs) dirs) files)]
+      [else (loop (cdr xs) dirs (cons (car xs) files))])))
 
 (define (forest-dir-marker path)
   (if (hash-contains? *forest-directories* path)
@@ -431,15 +441,14 @@
   (define result '())
   (define (walk path depth)
     (define name (file-name path))
-    (unless (or (hashset-contains? *forest-ignore-set* name)
-                (and (not *forest-show-hidden*) (forest-dotfile? name))
-                (and (not *forest-show-git-ignored*) (forest-git-ignored? path)))
+    (unless (forest-skip-entry? path)
       (define indent (forest-repeat-str "  " depth))
       (define marker (if (is-dir? path) (forest-dir-marker path) "  "))
       (set! result (cons (list path indent marker name) result))
       (when (is-dir? path)
         (unless (hash-contains? *forest-directories* path)
           (set! *forest-directories* (hash-insert *forest-directories* path (> depth 0))))
+        ;; hash-try-get is #t when collapsed, so children of closed dirs are not read
         (unless (hash-try-get *forest-directories* path)
           (for-each (lambda (child) (walk child (+ depth 1)))
                     (forest-sort-entries (read-dir path)))))))
@@ -491,25 +500,35 @@
     (when (and entry (equal? (car entry) (helix-find-workspace)))
       (forest-enter-dir! (car entry)))))
 
-;; flat recursive file list for search
-;; searches files indepedent of the fold state
-(define (forest-scan-files!)
-  (define root (helix-find-workspace))
+;; search index is independent of folds; filled on first query so open
+;; does not walk collapsed directories
+(define (forest-collect-files root)
   (define root-prefix (string-append root (path-separator)))
   (define acc '())
   (define (walk dir)
     (for-each
      (lambda (p)
-       (define name (file-name p))
-       (unless (hashset-contains? *forest-ignore-set* name)
+       (unless (forest-skip-entry? p)
          (if (is-dir? p)
              (walk p)
              (set! acc (cons p acc)))))
      (with-handler (lambda (_) '()) (read-dir dir))))
   (walk root)
-  (set! *forest-all-files*
-        (sort (map (lambda (p) (substring p (string-length root-prefix) (string-length p))) acc)
-              string<?)))
+  (sort (map (lambda (p) (substring p (string-length root-prefix) (string-length p))) acc)
+        string<?))
+
+(define (forest-scan-files!)
+  (set! *forest-all-files* (forest-collect-files (helix-find-workspace)))
+  (set! *forest-files-scanned?* #t))
+
+;; create/rename/delete/refresh drop the cache; next search rebuilds it
+(define (forest-invalidate-files!)
+  (set! *forest-files-scanned?* #f)
+  (set! *forest-all-files* '()))
+
+(define (forest-ensure-files!)
+  (unless *forest-files-scanned?*
+    (forest-scan-files!)))
 
 (define (forest-active-count)
   (if (forest-searching?) (length *forest-search-results*) (length *forest-tree*)))
@@ -581,7 +600,12 @@
 
 (define (forest-refresh-search!)
   (set! *forest-search-results*
-        (if (forest-searching?) (fuzzy-match *forest-query* *forest-all-files*) '())))
+        (if (forest-searching?)
+            (begin
+              ;; first character of a query is what walks the workspace, not forest-open
+              (forest-ensure-files!)
+              (fuzzy-match *forest-query* *forest-all-files*))
+            '())))
 
 (define (forest-type! ch)
   (set! *forest-query* (string-append *forest-query* (string ch)))
@@ -615,7 +639,8 @@
 (define (forest-refresh-all!)
   (define old *forest-cursor*)
   (forest-build-tree!)
-  (forest-scan-files!)
+  ;; skip the full file walk unless a search query is already active
+  (forest-invalidate-files!)
   (forest-refresh-search!)
   (set! *forest-cursor* (min old (max 0 (- (forest-active-count) 1)))))
 
@@ -1308,7 +1333,8 @@
             (define marker (list-ref entry 2))
             (define name (list-ref entry 3))
             (define prefix (string-append indent marker))
-            (define dir? (is-dir? path))
+            ;; marker is already "▶ "/"▼ " for dirs; avoid is-dir? on every frame
+            (define dir? (not (equal? marker "  ")))
             (define icon (if dir? (glyph-dir-icon name) (glyph-icon name)))
             (define icon-color (if dir? (glyph-dir-color name) (glyph-color name)))
             (define git-status (and (not dir?) (forest-git-status path)))
@@ -1526,12 +1552,12 @@
      (set! *forest-window-start* 0)
      (set! *forest-query* "")
      (set! *forest-search-results* '())
-     (set! *forest-typing?* #f)
-     (forest-scan-git-ignored! (helix-find-workspace))
-     (forest-reveal-current-file!)
-     (forest-scan-files!)
-     (push-component! (forest-make-bg-component))
-     (push-component! (forest-make-fg-component))]
+      (set! *forest-typing?* #f)
+      (forest-scan-git-ignored! (helix-find-workspace))
+      ;; reveal + build-tree only read expanded dirs; search index waits for /
+      (forest-reveal-current-file!)
+      (push-component! (forest-make-bg-component))
+      (push-component! (forest-make-fg-component))]
 
     [*forest-focused*
      (forest-switch-to-editor!)]
@@ -1554,12 +1580,9 @@
 (struct ForestMiniColumn (path entries cursor))
 
 (define (forest-mini-list-dir path)
+  ;; one directory only, same skip rules as the snacks tree
   (define children
-    (filter (lambda (p)
-              (define name (file-name p))
-              (not (or (hashset-contains? *forest-ignore-set* name)
-                       (and (not *forest-show-hidden*) (forest-dotfile? name))
-                       (and (not *forest-show-git-ignored*) (forest-git-ignored? p)))))
+    (filter (lambda (p) (not (forest-skip-entry? p)))
             (with-handler (lambda (_) '()) (read-dir path))))
   (map (lambda (p) (cons p (file-name p))) (forest-sort-entries children)))
 
@@ -1670,18 +1693,9 @@
       (forest-mini-build-stack-for root path)
       (list (ForestMiniColumn root (forest-mini-list-dir root) (box 0)))))
 
-;; flat recursive file list for search, independent of the cascaded columns
+;; mini search still walks the workspace; it shares skip-entry with snacks
 (define (forest-mini-scan-files root)
-  (define prefix (string-append root (path-separator)))
-  (define acc '())
-  (define (walk dir)
-    (for-each
-     (lambda (p)
-       (unless (hashset-contains? *forest-ignore-set* (file-name p))
-         (if (is-dir? p) (walk p) (set! acc (cons p acc)))))
-     (with-handler (lambda (_) '()) (read-dir dir))))
-  (walk root)
-  (sort (map (lambda (p) (substring p (string-length prefix) (string-length p))) acc) string<?))
+  (forest-collect-files root))
 
 ;; panels grow and shrink with their own content with safe bound clamping
 (define (forest-mini-longest-name entries)
