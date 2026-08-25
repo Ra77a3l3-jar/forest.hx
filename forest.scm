@@ -500,9 +500,40 @@
     (when (and entry (equal? (car entry) (helix-find-workspace)))
       (forest-enter-dir! (car entry)))))
 
-;; search index is independent of folds; filled on first query so open
-;; does not walk collapsed directories
-(define (forest-collect-files root)
+;; ignore-set and hidden names in any segment, matching the tree walk not entering those dirs
+(define (forest-rel-skipped? rel)
+  (let loop ([ss (split-many rel (path-separator))])
+    (cond
+      [(null? ss) #f]
+      [(hashset-contains? *forest-ignore-set* (car ss)) #t]
+      [(and (not *forest-show-hidden*) (forest-dotfile? (car ss))) #t]
+      [else (loop (cdr ss))])))
+
+(define (forest-git-ls-lines root args)
+  (with-handler
+    (lambda (_) #f)
+    (let ([proc (~> (command "git" (append (list "-c" "core.quotepath=false" "-C" root) args))
+                    with-stdout-piped
+                    with-stderr-piped
+                    spawn-process)])
+      (if (Ok? proc)
+          (filter (lambda (l) (> (string-length l) 0))
+                  (split-many (read-port-to-string (child-stdout (Ok->value proc))) "\n"))
+          #f))))
+
+;; git ls-files is the search index when this is a repo; #f means use the steel walk
+(define (forest-git-ls-files root)
+  (define tracked (forest-git-ls-lines root (list "ls-files" "-co" "--exclude-standard")))
+  (if (not tracked)
+      #f
+      (let ([all (if *forest-show-git-ignored*
+                     (let ([ignored (forest-git-ls-lines root (list "ls-files" "-o" "-i" "--exclude-standard"))])
+                       (append tracked (if ignored ignored '())))
+                     tracked)])
+        (sort (filter (lambda (rel) (not (forest-rel-skipped? rel))) all) string<?))))
+
+;; steel walk used when git is missing or ls-files could not run
+(define (forest-walk-files root)
   (define root-prefix (string-append root (path-separator)))
   (define acc '())
   (define (walk dir)
@@ -516,6 +547,15 @@
   (walk root)
   (sort (map (lambda (p) (substring p (string-length root-prefix) (string-length p))) acc)
         string<?))
+
+;; search index is independent of folds; filled on first query so open
+;; does not walk collapsed directories
+(define (forest-collect-files root)
+  ;; never treat a failed git as an empty index: that made / match nothing
+  (if (forest-git-repo? root)
+      (let ([files (forest-git-ls-files root)])
+        (if files files (forest-walk-files root)))
+      (forest-walk-files root)))
 
 (define (forest-scan-files!)
   (set! *forest-all-files* (forest-collect-files (helix-find-workspace)))
@@ -598,13 +638,41 @@
       (and (not (null? *forest-tree*))
            (list-ref *forest-tree* *forest-cursor*))))
 
+;; steel has no string-contains?; contiguous match, not subsequence
+(define (forest-string-contains? hay needle)
+  (define hlen (string-length hay))
+  (define nlen (string-length needle))
+  (cond
+    [(= nlen 0) #t]
+    [(< hlen nlen) #f]
+    [else
+     (let loop ([i 0])
+       (cond
+         [(> i (- hlen nlen)) #f]
+         [(equal? (substring hay i (+ i nlen)) needle) #t]
+         [else (loop (+ i 1))]))]))
+
+;; filename starts with query first, then filename contains it; letters out of order do not match
+(define (forest-filter-search files query)
+  (define q (string-downcase query))
+  (define prefixed '())
+  (define contained '())
+  (for-each
+   (lambda (rel)
+     (define name (string-downcase (file-name rel)))
+     (cond
+       [(starts-with? name q) (set! prefixed (cons rel prefixed))]
+       [(forest-string-contains? name q) (set! contained (cons rel contained))]))
+   files)
+  (append (reverse prefixed) (reverse contained)))
+
 (define (forest-refresh-search!)
   (set! *forest-search-results*
         (if (forest-searching?)
             (begin
-              ;; first character of a query is what walks the workspace, not forest-open
+              ;; first character of a query fills the index (git ls-files, or a walk)
               (forest-ensure-files!)
-              (fuzzy-match *forest-query* *forest-all-files*))
+              (forest-filter-search *forest-all-files* *forest-query*))
             '())))
 
 (define (forest-type! ch)
@@ -968,14 +1036,19 @@
 (define *forest-query-prefix* "> ")
 
 (define (forest-match-positions name query)
-  (let loop ([ns (string->list (string-downcase name))]
-             [qs (string->list (string-downcase query))]
-             [i 0]
-             [acc '()])
-    (cond
-      [(or (null? qs) (null? ns)) (reverse acc)]
-      [(char=? (car ns) (car qs)) (loop (cdr ns) (cdr qs) (+ i 1) (cons i acc))]
-      [else (loop (cdr ns) qs (+ i 1) acc)])))
+  (define h (string-downcase name))
+  (define n (string-downcase query))
+  (define hlen (string-length h))
+  (define nlen (string-length n))
+  (if (or (= nlen 0) (< hlen nlen))
+      '()
+      (let loop ([i 0])
+        (cond
+          [(> i (- hlen nlen)) '()]
+          [(equal? (substring h i (+ i nlen)) n)
+           (let pos ([k 0] [acc '()])
+             (if (= k nlen) (reverse acc) (pos (+ k 1) (cons (+ i k) acc))))]
+          [else (loop (+ i 1))]))))
 
 (define (forest-match-style base)
   (define c (style->fg (theme-scope-ref "special")))
@@ -1693,7 +1766,7 @@
       (forest-mini-build-stack-for root path)
       (list (ForestMiniColumn root (forest-mini-list-dir root) (box 0)))))
 
-;; mini search still walks the workspace; it shares skip-entry with snacks
+;; mini search uses the same index as snacks (git ls-files, walk fallback)
 (define (forest-mini-scan-files root)
   (forest-collect-files root))
 
@@ -1833,7 +1906,7 @@
       ""
       (lambda (query)
         (unless (equal? query "")
-          (define matches (fuzzy-match query (forest-mini-scan-files root)))
+          (define matches (forest-filter-search (forest-mini-scan-files root) query))
           (if (null? matches)
               (forest-error (string-append "no matches for '" query "'"))
               (set! *forest-mini-stack*
