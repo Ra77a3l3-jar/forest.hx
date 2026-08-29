@@ -145,6 +145,7 @@
 (provide forest-set-keybinds!)
 (provide forest-set-sidebar-bg!)
 (provide forest-set-search-color!)
+(provide forest-snack-circular-keybinds)
 (provide forest-snacks-active?)
 (provide forest-snacks-side)
 (provide forest-snacks-width)
@@ -185,11 +186,17 @@
   (set! *forest-show-separator?* separator?))
 
 (define *forest-style* 'snacks)
+(define *forest-snack-circular-keybinds?* #f)
 
 ;;@doc
 ;; Pick which explorer UI forest-open uses: 'snacks or 'mini
 (define (forest-set-style! style)
   (set! *forest-style* style))
+
+;;@doc
+;; Snacks only. #t wraps j/k inside the current folder and uses h/l to enter or leave
+(define (forest-snack-circular-keybinds enabled?)
+  (set! *forest-snack-circular-keybinds?* enabled?))
 
 ;; #rrggbb string to a Color, or #f on anything unparseable
 (define (forest-hex->color hex)
@@ -288,11 +295,18 @@
 
 ;; snaks keybinds
 (define (forest-snacks-help-rows)
-  (list
-    (list (string-append (forest-help-key 'down) " / " (forest-help-key 'up) " / ↑ / ↓") "Navigate in folder")
-    (list (string-append (forest-help-key 'enter) " / →") "Enter dir or open file")
-    (list (string-append (forest-help-key 'back) " / ←") "Leave folder")
-    (list "Enter / Tab" "Toggle directory")
+  (append
+   (if *forest-snack-circular-keybinds?*
+       (list
+        (list (string-append (forest-help-key 'down) " / " (forest-help-key 'up) " / ↑ / ↓") "Navigate in folder")
+        (list (string-append (forest-help-key 'enter) " / →") "Enter dir or open file")
+        (list (string-append (forest-help-key 'back) " / ←") "Leave folder")
+        (list "Enter / Tab" "Toggle directory"))
+       (list
+        (list (string-append (forest-help-key 'down) " / " (forest-help-key 'up) " / ↑ / ↓") "Navigate")
+        (list "Enter" "Open file or toggle dir")
+        (list "Tab" "Toggle directory")))
+   (list
    (list (forest-help-key 'search) "Fuzzy search")
    (list (forest-help-key 'create) "Create file or dir")
    (list (forest-help-key 'rename) "Rename entry")
@@ -301,8 +315,8 @@
    (list (forest-help-key 'toggle-hidden) "Toggle dotfiles")
    (list (forest-help-key 'toggle-git-ignored) "Toggle git-ignored")
    (list (string-append (forest-help-key 'wider) " / " (forest-help-key 'narrower)) "Widen or narrow panel")
-   (list "Esc" "Focus editor")
-   (list (forest-help-key 'quit) "Close panel")))
+    (list "Esc" "Focus editor")
+    (list (forest-help-key 'quit) "Close panel"))))
 
 ;; mini keybinds
 (define (forest-mini-help-rows)
@@ -555,21 +569,33 @@
     (set! *forest-cursor* (list-ref idxs (forest-wrap (+ pos delta) n)))
     (forest-ensure-cursor-visible!)))
 
+(define (forest-cursor-linear! delta)
+  (define n (forest-active-count))
+  (when (> n 0)
+    (set! *forest-cursor* (max 0 (min (- n 1) (+ *forest-cursor* delta))))
+    (forest-ensure-cursor-visible!)))
+
 (define (forest-cursor-down!)
-  (if (forest-searching?)
-      (let ([n (forest-active-count)])
-        (when (> n 0)
-          (set! *forest-cursor* (forest-wrap (+ *forest-cursor* 1) n))
-          (forest-ensure-cursor-visible!)))
-      (forest-cursor-sibling! 1)))
+  (cond
+    [(and (not (forest-searching?)) *forest-snack-circular-keybinds?*)
+     (forest-cursor-sibling! 1)]
+    [(and (forest-searching?) *forest-snack-circular-keybinds?*)
+     (let ([n (forest-active-count)])
+       (when (> n 0)
+         (set! *forest-cursor* (forest-wrap (+ *forest-cursor* 1) n))
+         (forest-ensure-cursor-visible!)))]
+    [else (forest-cursor-linear! 1)]))
 
 (define (forest-cursor-up!)
-  (if (forest-searching?)
-      (let ([n (forest-active-count)])
-        (when (> n 0)
-          (set! *forest-cursor* (forest-wrap (- *forest-cursor* 1) n))
-          (forest-ensure-cursor-visible!)))
-      (forest-cursor-sibling! -1)))
+  (cond
+    [(and (not (forest-searching?)) *forest-snack-circular-keybinds?*)
+     (forest-cursor-sibling! -1)]
+    [(and (forest-searching?) *forest-snack-circular-keybinds?*)
+     (let ([n (forest-active-count)])
+       (when (> n 0)
+         (set! *forest-cursor* (forest-wrap (- *forest-cursor* 1) n))
+         (forest-ensure-cursor-visible!)))]
+    [else (forest-cursor-linear! -1)]))
 
 (define (forest-current-entry)
   (if (forest-searching?)
@@ -1413,8 +1439,12 @@
   (cond
     [(equal? action 'down) (forest-cursor-down!) event-result/consume]
     [(equal? action 'up) (forest-cursor-up!) event-result/consume]
-    [(equal? action 'enter) (forest-enter-or-open!)]
-    [(equal? action 'back) (forest-goto-parent!) event-result/consume]
+    [(equal? action 'enter)
+     (if *forest-snack-circular-keybinds?* (forest-enter-or-open!) event-result/consume)]
+    [(equal? action 'back)
+     (if *forest-snack-circular-keybinds?*
+         (begin (forest-goto-parent!) event-result/consume)
+         event-result/consume)]
     [(equal? action 'search) (forest-enter-search!) event-result/consume]
     [(equal? action 'create) (forest-prompt-create!) event-result/consume]
     [(equal? action 'rename) (forest-prompt-rename!) event-result/consume]
@@ -1433,8 +1463,12 @@
   (cond
     [(key-event-down? event) (forest-cursor-down!) event-result/consume]
     [(key-event-up? event) (forest-cursor-up!) event-result/consume]
-    [(key-event-right? event) (forest-enter-or-open!)]
-    [(key-event-left? event) (forest-goto-parent!) event-result/consume]
+    [(key-event-right? event)
+     (if *forest-snack-circular-keybinds?* (forest-enter-or-open!) event-result/consume)]
+    [(key-event-left? event)
+     (if *forest-snack-circular-keybinds?*
+         (begin (forest-goto-parent!) event-result/consume)
+         event-result/consume)]
     [(key-event-enter? event) (forest-activate!)]
     [(key-event-tab? event)
      (define entry (forest-current-entry))

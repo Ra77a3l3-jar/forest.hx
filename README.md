@@ -38,6 +38,9 @@ forge pkg install --git https://github.com/Ra77a3l3-jar/forest.hx.git
 ;; (forest-set-style! style)
 (forest-set-style! 'snacks) ; or 'mini
 
+;; Optional (snacks): wrapping j/k inside a folder, and h/l to enter or leave
+(forest-snack-circular-keybinds #t)
+
 ;; Optional (snacks): give the sidebar its own background per focus state, so the
 ;; tree stands apart from the buffer.
 (forest-set-sidebar-bg! #:focused "#1e1e2e" #:unfocused "#181825")
@@ -64,10 +67,9 @@ Bind `:forest-open` to a key, e.g. in `init.scm`:
 
 | Key | Action |
 |-----|--------|
-| `↑` / `↓` / `j` / `k` | Navigate within the current folder, wrapping at the ends |
-| `→` / `l` | Enter the selected directory, or open the selected file |
-| `←` / `h` | Leave the current folder and collapse it |
-| `Enter` / `Tab` | Toggle the selected directory (outside search) |
+| `↑` / `↓` / `j` / `k` | Move through the tree |
+| `Enter` | Open the selected file, or toggle the selected directory |
+| `Tab` | Toggle the selected directory (outside search) |
 | `/` | Start typing a fuzzy search query |
 | `n` | Create a file or directory (end name with `/` for a directory) |
 | `r` | Rename the selected entry |
@@ -79,6 +81,8 @@ Bind `:forest-open` to a key, e.g. in `init.scm`:
 | `Space` | Open the which-key menu; press any listed key to run its action (`Esc` dismisses) |
 | `Esc` | Switch focus to the editor, panel stays open |
 | `q` | Close the panel |
+
+With `(forest-snack-circular-keybinds #t)`, `j`/`k` wrap inside the current folder, `l`/`→` enter a directory or open a file, and `h`/`←` leave the folder.
 
 Opening or refocusing the tree reveals and centers whatever file is currently open in the editor.
 
