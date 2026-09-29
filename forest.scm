@@ -851,15 +851,15 @@
   (enqueue-thread-local-callback
    (lambda ()
      (forest-clear-clip!)
-     (helix.redraw '()))))
+     (helix.redraw))))
 
 (define (forest-wider!)
   (set! *forest-width* (min *forest-max-width* (+ *forest-width* 2)))
-  (helix.redraw '()))
+  (helix.redraw))
 
 (define (forest-narrower!)
   (set! *forest-width* (max *forest-min-width* (- *forest-width* 2)))
-  (helix.redraw '()))
+  (helix.redraw))
 
 (define *forest-modal-open?* #f)
 (define *forest-modal-mode* 'input)
@@ -1494,7 +1494,7 @@
     [dir
      ;; scrolling over the panel reads as inspecting it, not entering it
      (forest-debounce-scroll! (lambda () (forest-scroll-by! dir *forest-scroll-amount*)))
-     (helix.redraw '()) ; unfocused, so consuming alone won't re-render
+     (helix.redraw) ; unfocused, so consuming alone won't re-render
      event-result/consume]
     [else event-result/ignore]))
 
