@@ -1538,12 +1538,8 @@
   (cond
     [(equal? action 'down) (forest-cursor-down!) event-result/consume]
     [(equal? action 'up) (forest-cursor-up!) event-result/consume]
-    [(equal? action 'enter)
-     (if *forest-snack-circular-keybinds?* (forest-enter-or-open!) event-result/consume)]
-    [(equal? action 'back)
-     (if *forest-snack-circular-keybinds?*
-         (begin (forest-goto-parent!) event-result/consume)
-         event-result/consume)]
+    [(equal? action 'enter) (forest-enter-or-open!)]
+    [(equal? action 'back) (forest-goto-parent!) event-result/consume]
     [(equal? action 'search) (forest-enter-search!) event-result/consume]
     [(equal? action 'create) (forest-prompt-create!) event-result/consume]
     [(equal? action 'rename) (forest-prompt-rename!) event-result/consume]
@@ -1562,12 +1558,8 @@
   (cond
     [(key-event-down? event) (forest-cursor-down!) event-result/consume]
     [(key-event-up? event) (forest-cursor-up!) event-result/consume]
-    [(key-event-right? event)
-     (if *forest-snack-circular-keybinds?* (forest-enter-or-open!) event-result/consume)]
-    [(key-event-left? event)
-     (if *forest-snack-circular-keybinds?*
-         (begin (forest-goto-parent!) event-result/consume)
-         event-result/consume)]
+    [(key-event-right? event) (forest-enter-or-open!)]
+    [(key-event-left? event) (forest-goto-parent!) event-result/consume]
     [(key-event-enter? event) (forest-activate!)]
     [(key-event-tab? event)
      (define entry (forest-current-entry))
