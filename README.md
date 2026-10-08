@@ -68,6 +68,8 @@ Bind `:forest-open` to a key, e.g. in `init.scm`:
 | Key | Action |
 |-----|--------|
 | `↑` / `↓` / `j` / `k` | Move through the tree |
+| `→` / `l` | Expand the selected directory and move to its first child, or open the selected file |
+| `←` / `h` | Collapse the current folder and move to its parent |
 | `Enter` | Open the selected file, or toggle the selected directory |
 | `Tab` | Toggle the selected directory (outside search) |
 | `/` | Start typing a fuzzy search query |
@@ -82,7 +84,7 @@ Bind `:forest-open` to a key, e.g. in `init.scm`:
 | `Esc` | Switch focus to the editor, panel stays open |
 | `q` | Close the panel |
 
-With `(forest-snack-circular-keybinds #t)`, `j`/`k` wrap inside the current folder, `l`/`→` enter a directory or open a file, and `h`/`←` leave the folder.
+With `(forest-snack-circular-keybinds #t)`, `j`/`k` wrap inside the current folder instead of moving through the whole tree.
 
 Opening or refocusing the tree reveals and centers whatever file is currently open in the editor.
 
