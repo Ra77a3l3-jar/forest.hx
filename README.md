@@ -34,6 +34,11 @@ forge pkg install --git https://github.com/Ra77a3l3-jar/forest.hx.git
 ;; entry names are always hidden
 (forest-configure! 'left #:ignore (list ".git" "target" "__pycache__"))
 
+;; Optional: show dotfiles and git-ignored entries from the start. Both are
+;; hidden by default, and `.`/`i` still toggle them at runtime.
+(forest-set-hidden! #t)
+(forest-set-git-ignored! #f)
+
 ;; Optional: which explorer UI forest-open uses ('snacks by default)
 ;; (forest-set-style! style)
 (forest-set-style! 'snacks) ; or 'mini
