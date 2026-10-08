@@ -142,6 +142,8 @@
 (provide forest-open)
 (provide forest-close)
 (provide forest-configure!)
+(provide forest-set-hidden!)
+(provide forest-set-git-ignored!)
 (provide forest-set-style!)
 (provide forest-set-keybinds!)
 (provide forest-set-sidebar-bg!)
@@ -185,6 +187,16 @@
   (set! *forest-side* side)
   (set! *forest-ignore-set* (apply hashset ignore))
   (set! *forest-show-separator?* separator?))
+
+;;@doc
+;; Show or hide dotfiles in the tree. Hidden by default.
+(define (forest-set-hidden! enabled?)
+  (set! *forest-show-hidden* enabled?))
+
+;;@doc
+;; Show or hide git-ignored entries in the tree. Hidden by default.
+(define (forest-set-git-ignored! enabled?)
+  (set! *forest-show-git-ignored* enabled?))
 
 (define *forest-style* 'snacks)
 (define *forest-snack-circular-keybinds?* #f)
