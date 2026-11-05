@@ -469,8 +469,15 @@
   (walk (helix-find-workspace) 0)
   (set! *forest-tree* (reverse result)))
 
+;; Strips suffix once. trim-end-matches strips it repeatedly, so for
+;; ".../app/app" with suffix "/app" it would drop both segments.
+(define (forest-strip-suffix-once s suffix)
+  (if (ends-with? s suffix)
+      (substring s 0 (- (string-length s) (string-length suffix)))
+      s))
+
 (define (forest-parent-path path)
-  (trim-end-matches path (string-append (path-separator) (file-name path))))
+  (forest-strip-suffix-once path (string-append (path-separator) (file-name path))))
 
 (define (forest-half-floor n)
   (let loop ([n n] [h 0])
@@ -483,11 +490,15 @@
   (when (and (string? path)
              (>= (string-length path) (string-length ws-prefix))
              (equal? (substring path 0 (string-length ws-prefix)) ws-prefix))
+    ;; stops at the workspace root, and never climbs above it even if a
+    ;; parent computation goes wrong
     (define (open-up! p)
       (define parent (forest-parent-path p))
-      (set! *forest-directories* (hash-insert *forest-directories* parent #f))
-      (unless (equal? parent ws)
-        (open-up! parent)))
+      (when (and (< (string-length parent) (string-length p))
+                 (>= (string-length parent) (string-length ws)))
+        (set! *forest-directories* (hash-insert *forest-directories* parent #f))
+        (unless (equal? parent ws)
+          (open-up! parent))))
     (open-up! path)))
 
 ;; moves the cursor to the file path
@@ -986,7 +997,7 @@
     (define path (car entry))
     (define base (if (is-dir? path)
                       (string-append path (path-separator))
-                      (trim-end-matches path (file-name path))))
+                      (forest-strip-suffix-once path (file-name path))))
     (enqueue-thread-local-callback
      (lambda ()
        (forest-show-modal!
@@ -1012,7 +1023,7 @@
   (when entry
     (define path (car entry))
     (define name (file-name path))
-    (define dir (trim-end-matches path (string-append (path-separator) name)))
+    (define dir (forest-strip-suffix-once path (string-append (path-separator) name)))
     (enqueue-thread-local-callback
      (lambda ()
        (forest-show-modal!
@@ -1890,7 +1901,7 @@
   (when entry
     (define path (car entry))
     (define name (file-name path))
-    (define dir (trim-end-matches path (string-append (path-separator) name)))
+    (define dir (forest-strip-suffix-once path (string-append (path-separator) name)))
     (enqueue-thread-local-callback
      (lambda ()
        (forest-show-modal!
